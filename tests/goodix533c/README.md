@@ -163,6 +163,31 @@ Accordingly `custom.py`:
 Neither of the two new captures described above were made as part of
 adding this fixture.
 
+**Snaplen ruled out as the cause.** After this fixture was added, two
+fresh finger-absent recapture attempts were made (via
+`capture_fixture_session.py`, same safe no-finger-only script, using
+`tshark -i usbmon3 -s 0 ...` and then `-s 65535 ...` -- explicit
+unlimited and explicit-large snap lengths respectively) specifically to
+test whether a truncated capture snaplen was the cause. Both attempts
+reproduced the exact same result: every bulk-IN (`0x83`) completion
+event capped at exactly 64 bytes total frame length with 0 bytes of
+captured payload, identical to the original fixture. Raw hex inspection
+of one such frame (`tshark -x`) confirms the 64 bytes are consumed
+entirely by usbmon's own binary capture header, with no payload bytes
+attached at all -- not a truncated-but-present payload, a genuinely
+absent one. This means the gap is not a tshark/dumpcap snaplen flag
+issue; the actual cause is some other property of how `usbmon`'s
+binary interface is capturing (or not capturing) this device's
+bulk-IN completions on this system/kernel, not yet identified. Both
+recapture attempts were deleted (they added no value and, being
+finger-absent, carried no sensitivity, but there was no reason to keep
+them). Whoever picks up "fix the replay gap" next should start by
+ruling out something other than snaplen -- e.g. usbmon's ring buffer
+size (`/sys/kernel/debug/usb/usbmon/` / `MON_IOCT_RING_SIZE`), a
+`usbmon0u` text-mode capture as a simpler diagnostic cross-check, or
+capturing via `dumpcap` directly instead of through `tshark`'s
+wrapper.
+
 ## Replay
 
 ```sh
