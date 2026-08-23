@@ -49,21 +49,49 @@ G_DECLARE_FINAL_TYPE (FpiDeviceGoodix533c, fpi_device_goodix533c, FPI,
 #define GOODIX533C_SENSOR_WIDTH  (108)
 #define GOODIX533C_SENSOR_HEIGHT (88)
 
+/* Matches driver_53xc.py's wait_for_finger() overall deadline (30s).
+ * Public so a test harness can quote the same figure in its prompt
+ * instead of duplicating the number. */
+#define GOODIX533C_FINGER_WAIT_TIMEOUT_MS (30000)
+
+/**
+ * Goodix533cProgressFunc: called once, mid-sequence, right as the driver
+ * arms finger detection and starts waiting for a touch -- the harness's
+ * cue to prompt the user. No data, just a checkpoint.
+ */
+typedef void (*Goodix533cProgressFunc)(FpDevice *dev,
+                                       gpointer  user_data);
+
 /**
  * Goodix533cCaptureDoneFunc: callback for the test-only capture entry
- * point below.
+ * point below. Called exactly once, whether the sequence ran to
+ * completion or failed partway through -- any frames already captured
+ * before the failure are still handed back (non-NULL), so a harness can
+ * keep whatever succeeded instead of discarding it just because a later
+ * stage (e.g. finger-wait) failed.
  *
- * @raw_pixels: (nullable): GOODIX533C_SENSOR_WIDTH * GOODIX533C_SENSOR_HEIGHT
- *   12-bit-ish samples (one guint16 per pixel, unpacked straight off the
- *   wire -- not squashed), owned by the callee, valid only for the
- *   duration of the callback. NULL on error.
- * @squashed: (nullable): the same frame min-max stretched to 8 bits per
- *   pixel, row-major, GOODIX533C_SENSOR_WIDTH * GOODIX533C_SENSOR_HEIGHT
- *   bytes. NULL on error.
+ * @raw_pixels: (nullable): the no-finger reference frame,
+ *   GOODIX533C_SENSOR_WIDTH * GOODIX533C_SENSOR_HEIGHT 12-bit-ish samples
+ *   (one guint16 per pixel, unpacked straight off the wire -- not
+ *   squashed), owned by the callee, valid only for the duration of the
+ *   callback. NULL if the reference frame itself was never captured.
+ * @squashed: (nullable): the reference frame min-max stretched to 8 bits
+ *   per pixel, row-major, GOODIX533C_SENSOR_WIDTH * GOODIX533C_SENSOR_HEIGHT
+ *   bytes. NULL under the same condition as @raw_pixels.
+ * @live_raw_pixels: (nullable): the live (finger-present) frame, same
+ *   shape/units as @raw_pixels. NULL unless a finger was detected and a
+ *   live frame was successfully captured.
+ * @corrected: (nullable): the live frame flat-fielded against the
+ *   reference frame (least-squares scale+offset subtracted, see
+ *   flat_field() in driver_53xc.py) and then min-max stretched to 8 bits
+ *   per pixel, same shape as @squashed. This is the PGM-ready fingerprint
+ *   image. NULL under the same condition as @live_raw_pixels.
  */
-typedef void (*Goodix533cCaptureDoneFunc)(FpDevice *dev,
+typedef void (*Goodix533cCaptureDoneFunc)(FpDevice      *dev,
                                           const guint16 *raw_pixels,
                                           const guint8  *squashed,
+                                          const guint16 *live_raw_pixels,
+                                          const guint8  *corrected,
                                           gpointer       user_data,
                                           GError        *error);
 
@@ -72,10 +100,17 @@ typedef void (*Goodix533cCaptureDoneFunc)(FpDevice *dev,
  *
  * Not public libfprint API -- a test-only entry point for driving the
  * reset -> PSK/firmware check (already done by open()) -> TLS handshake ->
- * config upload -> FDT baseline -> one-frame capture sequence, for use by
- * a standalone test harness after fp_device_open() has completed. Must
- * only be called once per open() session.
+ * config upload -> FDT baseline -> reference-frame capture -> sleep/query
+ * -> arm finger detection -> wait for touch -> live-frame capture -> flat
+ * field sequence, for use by a standalone test harness after
+ * fp_device_open() has completed. Must only be called once per open()
+ * session.
+ *
+ * @wait_for_finger_cb: (nullable): invoked once finger detection is armed
+ *   and the driver starts waiting for a touch, so the harness can prompt
+ *   the user right before the bounded wait begins. May be NULL.
  */
 void fpi_device_goodix533c_capture_test (FpDevice                  *dev,
+                                         Goodix533cProgressFunc     wait_for_finger_cb,
                                          Goodix533cCaptureDoneFunc  callback,
                                          gpointer                   user_data);

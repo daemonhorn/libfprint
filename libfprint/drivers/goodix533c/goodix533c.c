@@ -57,9 +57,44 @@
 #define GOODIX533C_IMAGE_FLAGS_CALIBRATE (0x01)
 #define GOODIX533C_IMAGE_GAIN (0xc2)
 
+/* Live (finger-present) frame: flags = 0x01 | 0x40 per the findings doc.
+ * Gain is a *deliberate deviation* from driver_53xc.py's default -- see
+ * GOODIX533C_LIVE_IMAGE_GAIN below. */
+#define GOODIX533C_IMAGE_FLAGS_LIVE (0x41)
+
+/* driver_53xc.py's run_driver() uses gain 0x86 for the live capture
+ * (tuned for nikicat's XPS 13 9310). This project's own empirical finding
+ * (NOTES.md, "Ridge visibility resolved: gain calibration, not protocol")
+ * is that 0x86 clips ~47% of pixels on the hardware this project tests
+ * against, while 0xc2 -- the same gain already used for the reference
+ * frame -- is headroom-safe (0 clipped pixels) for *both* frame types on
+ * this unit. Using 0xc2 here too, not 0x86, is intentional and
+ * hardware-verified for this unit, not an oversight. A production driver
+ * would need a per-unit gain check rather than a hardcoded value, since
+ * the safe gain is apparently unit-specific -- out of scope here. */
+#define GOODIX533C_LIVE_IMAGE_GAIN (0xc2)
+
 #define GOODIX533C_CAPTURE_REGISTER (0x022c)
 static const guint8 capture_on[2] = { 0x0a, 0x03 };
 static const guint8 capture_off[2] = { 0x0a, 0x02 };
+
+/* Not in goodix_proto.h (0x60) -- defined locally like
+ * GOODIX533C_FLAGS_TLS_DATA above. */
+#define GOODIX533C_CMD_MCU_SWITCH_TO_SLEEP_MODE (0x60)
+
+/* FDT command prefixes -- fixed 2-byte prefix, each suffixed with the same
+ * 24-byte per-session template read during CAPTURE_STAGE_FDT_BASELINE.
+ * fdt_mode_idle (above) is the fourth member of this family, used with 24
+ * zero bytes to *measure* the template; these three arm/query it. */
+static const guint8 fdt_mode_armed[2] = { 0x8d, 0x01 };
+static const guint8 fdt_down_armed[2] = { 0x0c, 0x01 };
+static const guint8 fdt_up_armed[2] = { 0x0e, 0x01 };
+
+/* driver_53xc.py reads mcu_switch_to_fdt_up()'s reply with timeout=None
+ * (block indefinitely) -- the sensor isn't waiting on any further
+ * external input at this point (finger already detected), so a generous
+ * bounded timeout stands in safely for "no timeout" here. */
+#define GOODIX533C_FDT_UP_TIMEOUT_MS (5000)
 
 #define GOODIX533C_PSK_LENGTH (32)
 #define GOODIX533C_PSK_FLAGS (0xbb020001)
@@ -139,10 +174,16 @@ struct _FpiDeviceGoodix533c
   gboolean        tls_active;
 
   /* per-session FDT baseline, read fresh every open per the findings doc;
-   * unused beyond this scope (no fdt_down/fdt_up arming here) but kept for
-   * fidelity to the golden capture sequence. */
+   * appended (with a distinct fixed prefix) to every FDT arm/query
+   * command below. */
   guint8   fdt_template[24];
   gboolean have_fdt_template;
+
+  /* no-finger reference frame, kept around (not just handed to a callback
+   * and discarded) so a later live-frame capture in the same session can
+   * flat-field against it without re-measuring. */
+  guint16  *reference_pixels;
+  gboolean  have_reference;
 };
 
 G_DEFINE_TYPE (FpiDeviceGoodix533c, fpi_device_goodix533c, FP_TYPE_DEVICE)
@@ -586,6 +627,106 @@ cmd_mcu_get_image_gain (FpDevice *dev, guint8 flags, guint8 gain,
 }
 
 static void
+cmd_mcu_switch_to_sleep_mode (FpDevice *dev, Goodix533cCmdCallback callback,
+                              gpointer user_data)
+{
+  guint8 payload[2] = { 0x01, 0x00 };
+
+  /* Ack-only -- matches goodix.py's mcu_switch_to_sleep_mode(), which only
+   * ever calls _expect_ack(). */
+  send_protocol (dev, GOODIX533C_CMD_MCU_SWITCH_TO_SLEEP_MODE, payload,
+                 sizeof (payload), TRUE, GOODIX533C_TIMEOUT_MS, TRUE, FALSE,
+                 callback, user_data);
+}
+
+static void
+cmd_query_mcu_state (FpDevice *dev, const guint8 *payload, guint16 length,
+                     Goodix533cCmdCallback callback, gpointer user_data)
+{
+  /* This driver's one call site (run_driver()'s query_mcu_state(b"\x01\x00
+   * \x01", False) right after mcu_switch_to_sleep_mode()) always passes
+   * reply=False in driver_53xc.py -- ACK-only here, matching that. The
+   * reply=True data-read path (goodix.py's query_mcu_state()) is unused
+   * and not implemented. */
+  send_protocol (dev, GOODIX_CMD_QUERY_MCU_STATE, payload, length, TRUE,
+                 GOODIX533C_TIMEOUT_MS, TRUE, FALSE, callback, user_data);
+}
+
+static void
+cmd_mcu_switch_to_fdt_down (FpDevice *dev, const guint8 *mode, guint16 length,
+                            Goodix533cCmdCallback callback, gpointer user_data)
+{
+  /* Ack-only -- arms finger detection. The actual touch notification
+   * arrives later as a separate, asynchronous protocol pack tagged with
+   * this same command (see await_fdt_down_push() below), not as a reply
+   * to this call. Matches driver_53xc.py's one call site,
+   * mcu_switch_to_fdt_down(mode, False). */
+  send_protocol (dev, GOODIX_CMD_MCU_SWITCH_TO_FDT_DOWN, mode, length, TRUE,
+                 GOODIX533C_TIMEOUT_MS, TRUE, FALSE, callback, user_data);
+}
+
+static void
+cmd_mcu_switch_to_fdt_up (FpDevice *dev, const guint8 *mode, guint16 length,
+                          Goodix533cCmdCallback callback, gpointer user_data)
+{
+  /* ACK, then always a data reply -- see GOODIX533C_FDT_UP_TIMEOUT_MS. */
+  send_protocol (dev, GOODIX_CMD_MCU_SWITCH_TO_FDT_UP, mode, length, TRUE,
+                 GOODIX533C_FDT_UP_TIMEOUT_MS, TRUE, TRUE, callback,
+                 user_data);
+}
+
+/**
+ * await_fdt_down_push: wait for the device's unsolicited "finger touched"
+ * notification.
+ *
+ * No request is sent here -- the device pushes this pack on its own, some
+ * time after cmd_mcu_switch_to_fdt_down() armed detection, once (and only
+ * once) a finger actually lands. Manual protocol-reply state set, same
+ * shape as await_raw_pack() above (used for the TLS handshake's raw
+ * packs), just matched against a specific command byte instead of
+ * bypassing cmd matching entirely.
+ *
+ * driver_53xc.py's wait_for_finger() polls with a sequence of short (2s)
+ * blocking reads for up to 30s, working around a PyUSB limitation on long
+ * reads. FpiUsbTransfer has no such limitation -- the read loop
+ * (receive_data()) already has one bulk IN transfer permanently
+ * in-flight, so a single bounded timeout on the reply we're waiting for
+ * does the same job without polling.
+ */
+static void
+await_fdt_down_push (FpDevice *dev, guint timeout_ms,
+                     Goodix533cCmdCallback callback, gpointer user_data)
+{
+  FpiDeviceGoodix533c *self = FPI_DEVICE_GOODIX533C (dev);
+
+  if (self->ack_pending || self->reply_pending)
+    {
+      /* Must not silently hang the caller -- report it as a real failure,
+       * same as send_protocol() would if it could (it can only fp_warn()
+       * and drop, since it has no callback contract for this case; here
+       * we do have one, so use it). */
+      GError *error = NULL;
+
+      fp_warn ("A command is already running: 0x%02x", self->cmd);
+      g_set_error (&error, G_IO_ERROR, G_IO_ERROR_BUSY,
+                  "Cannot wait for finger: command 0x%02x still in flight",
+                  self->cmd);
+      callback (dev, NULL, 0, user_data, error);
+      return;
+    }
+
+  if (timeout_ms)
+    self->timeout_src = fpi_device_add_timeout (dev, timeout_ms,
+                                                on_command_timeout, NULL,
+                                                NULL);
+  self->cmd = GOODIX_CMD_MCU_SWITCH_TO_FDT_DOWN;
+  self->ack_pending = FALSE;
+  self->reply_pending = TRUE;
+  self->callback = callback;
+  self->user_data = user_data;
+}
+
+static void
 cmd_request_tls_connection (FpDevice *dev, Goodix533cCmdCallback callback,
                             gpointer user_data)
 {
@@ -862,11 +1003,12 @@ squash_frame_linear (const guint16 *frame, guint8 *squashed, guint32 count)
 }
 
 /* ===========================================================================
- * Capture-test sequence -- new code, following capture_golden_session.py /
- * driver_53xc.py's run_driver() exactly, simplified per this task's scope:
- * a single no-finger reference frame is decoded and handed back as-is (no
- * flat-fielding against a second frame, no finger-detect wait). See the
- * driver header and the final report for why.
+ * Capture sequence -- new code, following capture_golden_session.py /
+ * driver_53xc.py's run_driver() exactly: reset through the no-finger
+ * reference frame, then sleep/query -> arm finger detection -> wait for a
+ * touch -> live (finger-present) frame -> flat-field the live frame
+ * against the reference. One continuous FpiSsm, not two -- see the FDT
+ * arm/wait/capture stages appended below CAPTURE_STAGE_CAPTURE_OFF.
  * ======================================================================= */
 
 enum capture_stage {
@@ -876,19 +1018,32 @@ enum capture_stage {
   CAPTURE_STAGE_TLS,
   CAPTURE_STAGE_UPLOAD_CONFIG,
   CAPTURE_STAGE_FDT_BASELINE,
-  CAPTURE_STAGE_CAPTURE_ON,
+  CAPTURE_STAGE_CAPTURE_ON,       /* reference frame, no finger */
   CAPTURE_STAGE_GET_IMAGE,
   CAPTURE_STAGE_CAPTURE_OFF,
+  CAPTURE_STAGE_SLEEP,
+  CAPTURE_STAGE_QUERY_MCU_STATE,
+  CAPTURE_STAGE_FDT_ARM_DOWN,
+  CAPTURE_STAGE_WAIT_FOR_FINGER,
+  CAPTURE_STAGE_FDT_MODE_ARM,
+  CAPTURE_STAGE_CAPTURE_ON_LIVE,  /* live (finger-present) frame */
+  CAPTURE_STAGE_GET_IMAGE_LIVE,
+  CAPTURE_STAGE_CAPTURE_OFF_LIVE,
+  CAPTURE_STAGE_FDT_UP,
   CAPTURE_STAGE_NUM,
 };
 
 typedef struct
 {
+  Goodix533cProgressFunc    wait_for_finger_cb;
   Goodix533cCaptureDoneFunc callback;
   gpointer                  user_data;
 
-  guint16                  *raw_pixels;
+  guint16                  *raw_pixels;       /* reference frame */
   guint8                   *squashed;
+
+  guint16                  *live_raw_pixels;  /* live frame */
+  guint8                   *corrected;        /* flat-fielded + squashed */
 } CaptureData;
 
 static void
@@ -896,6 +1051,8 @@ capture_data_free (CaptureData *data)
 {
   g_free (data->raw_pixels);
   g_free (data->squashed);
+  g_free (data->live_raw_pixels);
+  g_free (data->corrected);
   g_free (data);
 }
 
@@ -993,9 +1150,28 @@ on_fdt_baseline_reply (FpDevice *dev, guint8 *data, guint16 length,
 
   /* Reply is a 4-byte header then 12-bit samples as 16-bit LE words. Vendor
    * driver halves each sample and emits it twice as the FDT threshold
-   * template -- see fdt_template() in driver_53xc.py. Not consumed further
-   * in this capture-only build (no fdt_down/fdt_up arming in scope), kept
-   * only for fidelity to the golden sequence. */
+   * template -- see fdt_template() in driver_53xc.py. Appended (with a
+   * distinct fixed 2-byte prefix) to every later FDT arm/query command in
+   * this same session -- see fdt_mode_armed/fdt_down_armed/fdt_up_armed
+   * above and their use in capture_run() below. */
+  /* Sample count: driver_53xc.py's fdt_template() computes this as
+   * len(range(4, length - 1, 2)), which looks off-by-one against the
+   * naive (length - 4) / 2 used below at first glance, but is not --
+   * range(4, length-1, 2) has floor((length-6)/2)+1 terms (for length>=6,
+   * else 0), and floor(x)+1 == floor(x+1) for any real x when 1 is an
+   * integer, so that's floor((length-6)/2 + 1) == floor((length-4)/2) --
+   * exactly the integer-division formula below. Verified algebraically,
+   * not just against this session's one hardware reply (which happened to
+   * land on the boundary case, length=28, 12 samples, where both
+   * formulas trivially agree). The MIN(..., 12u) cap has no Python
+   * equivalent -- Python's `samples` is an unbounded list, but this
+   * driver's fdt_template is a fixed 24-byte (12-sample) array because
+   * every FDT arm/query payload below is hardcoded to a fixed 2-byte
+   * prefix + 24-byte template (matching driver_53xc.py's own
+   * FDT_MODE_ARMED + template, etc., which are always built from a
+   * 24-byte template in practice); the cap only ever discards *extra*
+   * data past the first 12 samples, it does not change which of the
+   * first 12 samples are read. */
   memset (self->fdt_template, 0, sizeof (self->fdt_template));
   sample_count = MIN ((guint32) (length > 4 ? (length - 4) / 2 : 0), 12u);
   for (i = 0; i < sample_count; i++)
@@ -1010,29 +1186,26 @@ on_fdt_baseline_reply (FpDevice *dev, guint8 *data, guint16 length,
   fpi_ssm_next_state (ssm);
 }
 
-static void
-on_get_image_reply (FpDevice *dev, guint8 *data, guint16 length,
-                    gpointer user_data, GError *error)
+/**
+ * decode_get_image_reply: shared by the reference-frame and live-frame
+ * GET_IMAGE stages -- decrypt a mcu_get_image reply and decode it to
+ * pixels, optionally also min-max squashing to 8 bits. @out_squashed may
+ * be NULL if the caller doesn't need that (the live frame is squashed
+ * only after flat-fielding, not here).
+ */
+static gboolean
+decode_get_image_reply (FpiDeviceGoodix533c *self, guint8 *data,
+                        guint16 length, guint16 **out_raw_pixels,
+                        guint8 **out_squashed, GError **error)
 {
-  FpiSsm *ssm = user_data;
-  FpiDeviceGoodix533c *self = FPI_DEVICE_GOODIX533C (dev);
-  CaptureData *cap = fpi_ssm_get_data (ssm);
   guint8 decrypt_buf[65535];
   int decrypted;
-  GError *tls_error = NULL;
-
-  if (error)
-    {
-      fpi_ssm_mark_failed (ssm, error);
-      return;
-    }
 
   if (length <= GOODIX533C_IMAGE_REPLY_HEADER_LEN)
     {
-      fpi_ssm_mark_failed (ssm, g_error_new (G_IO_ERROR, G_IO_ERROR_FAILED,
-                                             "image reply too short: %d",
-                                             length));
-      return;
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                  "image reply too short: %d", length);
+      return FALSE;
     }
 
   /* Skip the pre-record header (see GOODIX533C_IMAGE_REPLY_HEADER_LEN's
@@ -1043,34 +1216,169 @@ on_get_image_reply (FpDevice *dev, guint8 *data, guint16 length,
                            (guint16) (length - GOODIX533C_IMAGE_REPLY_HEADER_LEN));
 
   decrypted = goodix_tls_server_read (&self->tls, decrypt_buf,
-                                      sizeof (decrypt_buf), &tls_error);
+                                      sizeof (decrypt_buf), error);
   if (decrypted <= 0)
     {
-      fpi_ssm_mark_failed (ssm, tls_error ? tls_error :
-                           g_error_new (G_IO_ERROR, G_IO_ERROR_FAILED,
-                                       "TLS decrypt failed"));
-      return;
+      if (error && !*error)
+        g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                    "TLS decrypt failed");
+      return FALSE;
     }
 
   if ((guint32) decrypted < GOODIX533C_IMAGE_BYTES)
     {
-      fpi_ssm_mark_failed (ssm, g_error_new (G_IO_ERROR, G_IO_ERROR_FAILED,
-                                             "short decrypt: %d < %d",
-                                             decrypted,
-                                             GOODIX533C_IMAGE_BYTES));
-      return;
+      g_set_error (error, G_IO_ERROR, G_IO_ERROR_FAILED,
+                  "short decrypt: %d < %d", decrypted,
+                  GOODIX533C_IMAGE_BYTES);
+      return FALSE;
     }
 
-  cap->raw_pixels = g_new0 (guint16, GOODIX533C_IMAGE_PIXELS);
-  cap->squashed = g_new0 (guint8, GOODIX533C_IMAGE_PIXELS);
-  decode_frame (cap->raw_pixels, decrypt_buf, GOODIX533C_IMAGE_BYTES);
-  squash_frame_linear (cap->raw_pixels, cap->squashed,
-                       GOODIX533C_IMAGE_PIXELS);
+  *out_raw_pixels = g_new0 (guint16, GOODIX533C_IMAGE_PIXELS);
+  decode_frame (*out_raw_pixels, decrypt_buf, GOODIX533C_IMAGE_BYTES);
+
+  if (out_squashed)
+    {
+      *out_squashed = g_new0 (guint8, GOODIX533C_IMAGE_PIXELS);
+      squash_frame_linear (*out_raw_pixels, *out_squashed,
+                           GOODIX533C_IMAGE_PIXELS);
+    }
 
   fp_dbg ("Decoded frame: %d bytes encrypted -> %d bytes plain -> %d pixels",
           length, decrypted, GOODIX533C_IMAGE_PIXELS);
 
+  return TRUE;
+}
+
+static void
+on_get_image_reply (FpDevice *dev, guint8 *data, guint16 length,
+                    gpointer user_data, GError *error)
+{
+  FpiSsm *ssm = user_data;
+  FpiDeviceGoodix533c *self = FPI_DEVICE_GOODIX533C (dev);
+  CaptureData *cap = fpi_ssm_get_data (ssm);
+  gboolean live = fpi_ssm_get_cur_state (ssm) == CAPTURE_STAGE_GET_IMAGE_LIVE;
+  guint16 *raw_pixels = NULL;
+  guint8 *squashed = NULL;
+  GError *decode_error = NULL;
+
+  if (error)
+    {
+      fpi_ssm_mark_failed (ssm, error);
+      return;
+    }
+
+  if (!decode_get_image_reply (self, data, length, &raw_pixels,
+                               live ? NULL : &squashed, &decode_error))
+    {
+      fpi_ssm_mark_failed (ssm, decode_error);
+      return;
+    }
+
+  if (live)
+    {
+      cap->live_raw_pixels = raw_pixels;
+    }
+  else
+    {
+      cap->raw_pixels = raw_pixels;
+      cap->squashed = squashed;
+
+      /* Keep a copy in the driver's private struct (not just handed to
+       * the callback) so the live-frame stages further down this same
+       * SSM can flat-field against it without re-measuring. */
+      g_clear_pointer (&self->reference_pixels, g_free);
+      self->reference_pixels = g_new (guint16, GOODIX533C_IMAGE_PIXELS);
+      memcpy (self->reference_pixels, raw_pixels,
+             GOODIX533C_IMAGE_PIXELS * sizeof (guint16));
+      self->have_reference = TRUE;
+    }
+
   fpi_ssm_next_state (ssm);
+}
+
+static void
+on_wait_finger_reply (FpDevice *dev, guint8 *data, guint16 length,
+                      gpointer user_data, GError *error)
+{
+  FpiSsm *ssm = user_data;
+
+  if (error)
+    {
+      if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT))
+        {
+          /* Give the caller a specific, actionable error instead of a bare
+           * protocol-layer timeout -- this is the expected, well-behaved
+           * outcome of running the sequence with no finger on the sensor. */
+          g_clear_error (&error);
+          error = fpi_device_error_new_msg (FP_DEVICE_ERROR_GENERAL,
+                                            "No finger detected within %d "
+                                            "seconds",
+                                            GOODIX533C_FINGER_WAIT_TIMEOUT_MS / 1000);
+        }
+      fpi_ssm_mark_failed (ssm, error);
+      return;
+    }
+
+  fp_dbg ("Finger detected (fdt_down push, %d bytes)", length);
+  fpi_ssm_next_state (ssm);
+}
+
+/**
+ * flat_field_squash: port of flat_field() in driver_53xc.py (ordinary
+ * least-squares regression of the live frame against the reference frame,
+ * then subtract the fitted line) followed by a min-max stretch of the
+ * (possibly negative, possibly >12-bit) residual to 8 bits -- the same
+ * squash technique squash_frame_linear() above uses for a raw frame, just
+ * over a double-precision residual instead of guint16 samples.
+ */
+static void
+flat_field_squash (const guint16 *frame, const guint16 *reference,
+                   guint32 count, guint8 *out)
+{
+  double mean_frame = 0, mean_reference = 0;
+  double variance = 0, covariance = 0;
+  double a, b;
+  g_autofree double *residual = g_new (double, count);
+  double min = G_MAXDOUBLE, max = -G_MAXDOUBLE;
+  guint32 i;
+
+  for (i = 0; i < count; i++)
+    {
+      mean_frame += frame[i];
+      mean_reference += reference[i];
+    }
+  mean_frame /= count;
+  mean_reference /= count;
+
+  for (i = 0; i < count; i++)
+    {
+      double d = (double) reference[i] - mean_reference;
+
+      variance += d * d;
+      covariance += ((double) frame[i] - mean_frame) * d;
+    }
+  if (variance == 0)
+    variance = 1;
+
+  a = covariance / variance;
+  b = mean_frame - a * mean_reference;
+
+  for (i = 0; i < count; i++)
+    {
+      residual[i] = (double) frame[i] - (a * (double) reference[i] + b);
+      if (residual[i] < min)
+        min = residual[i];
+      if (residual[i] > max)
+        max = residual[i];
+    }
+
+  for (i = 0; i < count; i++)
+    {
+      if (max <= min)
+        out[i] = 0;
+      else
+        out[i] = (guint8) (((residual[i] - min) * 0xff) / (max - min));
+    }
 }
 
 static void
@@ -1126,6 +1434,95 @@ capture_run (FpiSsm *ssm, FpDevice *dev)
                                  capture_off, on_capture_step_reply, ssm);
       break;
 
+    case CAPTURE_STAGE_SLEEP:
+      cmd_mcu_switch_to_sleep_mode (dev, on_capture_step_reply, ssm);
+      break;
+
+    case CAPTURE_STAGE_QUERY_MCU_STATE:
+        {
+          /* Payload taken verbatim from run_driver()'s
+           * query_mcu_state(b"\x01\x00\x01", False) call site. */
+          static const guint8 payload[3] = { 0x01, 0x00, 0x01 };
+
+          cmd_query_mcu_state (dev, payload, sizeof (payload),
+                               on_capture_step_reply, ssm);
+        }
+      break;
+
+    case CAPTURE_STAGE_FDT_ARM_DOWN:
+        {
+          FpiDeviceGoodix533c *self = FPI_DEVICE_GOODIX533C (dev);
+          guint8 mode[26];
+
+          memcpy (mode, fdt_down_armed, sizeof (fdt_down_armed));
+          memcpy (mode + sizeof (fdt_down_armed), self->fdt_template,
+                 sizeof (self->fdt_template));
+          cmd_mcu_switch_to_fdt_down (dev, mode, sizeof (mode),
+                                      on_capture_step_reply, ssm);
+        }
+      break;
+
+    case CAPTURE_STAGE_WAIT_FOR_FINGER:
+        {
+          CaptureData *cap = fpi_ssm_get_data (ssm);
+
+          if (cap->wait_for_finger_cb)
+            cap->wait_for_finger_cb (dev, cap->user_data);
+          await_fdt_down_push (dev, GOODIX533C_FINGER_WAIT_TIMEOUT_MS,
+                               on_wait_finger_reply, ssm);
+        }
+      break;
+
+    case CAPTURE_STAGE_FDT_MODE_ARM:
+        {
+          FpiDeviceGoodix533c *self = FPI_DEVICE_GOODIX533C (dev);
+          guint8 mode[26];
+
+          memcpy (mode, fdt_mode_armed, sizeof (fdt_mode_armed));
+          memcpy (mode + sizeof (fdt_mode_armed), self->fdt_template,
+                 sizeof (self->fdt_template));
+          /* reply=True, matching driver_53xc.py's
+           * mcu_switch_to_fdt_mode(FDT_MODE_ARMED + template, True) call
+           * site -- but run_driver() never uses the returned payload
+           * either, it just re-arms, so on_capture_step_reply discarding
+           * it here is correct, not a shortcut. */
+          cmd_mcu_switch_to_fdt_mode (dev, mode, sizeof (mode), TRUE,
+                                     on_capture_step_reply, ssm);
+        }
+      break;
+
+    case CAPTURE_STAGE_CAPTURE_ON_LIVE:
+      cmd_write_sensor_register (dev, GOODIX533C_CAPTURE_REGISTER,
+                                 capture_on, on_capture_step_reply, ssm);
+      break;
+
+    case CAPTURE_STAGE_GET_IMAGE_LIVE:
+      /* Gain 0xc2, not driver_53xc.py's default 0x86 for the live frame --
+       * see GOODIX533C_LIVE_IMAGE_GAIN's doc comment above for why this is
+       * a deliberate, hardware-verified deviation on this unit. */
+      cmd_mcu_get_image_gain (dev, GOODIX533C_IMAGE_FLAGS_LIVE,
+                              GOODIX533C_LIVE_IMAGE_GAIN, on_get_image_reply,
+                              ssm);
+      break;
+
+    case CAPTURE_STAGE_CAPTURE_OFF_LIVE:
+      cmd_write_sensor_register (dev, GOODIX533C_CAPTURE_REGISTER,
+                                 capture_off, on_capture_step_reply, ssm);
+      break;
+
+    case CAPTURE_STAGE_FDT_UP:
+        {
+          FpiDeviceGoodix533c *self = FPI_DEVICE_GOODIX533C (dev);
+          guint8 mode[26];
+
+          memcpy (mode, fdt_up_armed, sizeof (fdt_up_armed));
+          memcpy (mode + sizeof (fdt_up_armed), self->fdt_template,
+                 sizeof (self->fdt_template));
+          cmd_mcu_switch_to_fdt_up (dev, mode, sizeof (mode),
+                                   on_capture_step_reply, ssm);
+        }
+      break;
+
     default:
       g_assert_not_reached ();
     }
@@ -1134,19 +1531,37 @@ capture_run (FpiSsm *ssm, FpDevice *dev)
 static void
 capture_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
+  FpiDeviceGoodix533c *self = FPI_DEVICE_GOODIX533C (dev);
   CaptureData *cap = fpi_ssm_get_data (ssm);
 
-  cap->callback (dev, cap->raw_pixels, cap->squashed, cap->user_data, error);
+  /* Flat-field only if the live frame actually got captured -- e.g. the
+   * finger-wait stage timing out (the only path exercised against real
+   * hardware this session, since it requires no physical touch) leaves
+   * live_raw_pixels NULL and error non-NULL, and cap->raw_pixels/squashed
+   * (the reference frame, captured earlier in this same sequence) are
+   * still handed back below regardless of @error, so a harness never
+   * loses a frame that did succeed just because a later stage failed. */
+  if (cap->live_raw_pixels && self->have_reference)
+    {
+      cap->corrected = g_new0 (guint8, GOODIX533C_IMAGE_PIXELS);
+      flat_field_squash (cap->live_raw_pixels, self->reference_pixels,
+                         GOODIX533C_IMAGE_PIXELS, cap->corrected);
+    }
+
+  cap->callback (dev, cap->raw_pixels, cap->squashed, cap->live_raw_pixels,
+                cap->corrected, cap->user_data, error);
 }
 
 void
 fpi_device_goodix533c_capture_test (FpDevice *dev,
+                                    Goodix533cProgressFunc wait_for_finger_cb,
                                     Goodix533cCaptureDoneFunc callback,
                                     gpointer user_data)
 {
   CaptureData *cap = g_new0 (CaptureData, 1);
   FpiSsm *ssm;
 
+  cap->wait_for_finger_cb = wait_for_finger_cb;
   cap->callback = callback;
   cap->user_data = user_data;
 
@@ -1368,6 +1783,15 @@ goodix533c_close (FpDevice *dev)
   self->user_data = NULL;
   self->read_loop_started = FALSE;
 
+  /* Session-scoped state: the FDT template and reference frame are only
+   * valid for the session that measured/captured them (see the comments
+   * on measure_baseline()/FDT template dynamism in the findings doc).
+   * Clearing them here forces a fresh open() to redo both before any live
+   * capture can flat-field against a stale reference. */
+  g_clear_pointer (&self->reference_pixels, g_free);
+  self->have_reference = FALSE;
+  self->have_fdt_template = FALSE;
+
   if (self->interface_claimed)
     {
       g_usb_device_release_interface (fpi_device_get_usb_device (dev),
@@ -1393,6 +1817,7 @@ fpi_device_goodix533c_finalize (GObject *object)
   FpiDeviceGoodix533c *self = FPI_DEVICE_GOODIX533C (object);
 
   g_clear_pointer (&self->rx_buf, g_free);
+  g_clear_pointer (&self->reference_pixels, g_free);
   g_clear_object (&self->transfer_cancel_tkn);
 
   G_OBJECT_CLASS (fpi_device_goodix533c_parent_class)->finalize (object);

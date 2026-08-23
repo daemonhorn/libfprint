@@ -7,11 +7,19 @@
  * vfunc wired up yet (out of scope for this task). Builds only when
  * 'goodix533c' is in the enabled driver list (see libfprint/meson.build).
  *
- * Usage: goodix533c-capture-test [output.pgm]
+ * Usage: goodix533c-capture-test [reference-output.pgm]
+ *
+ * Drives the full sequence: reset -> TLS -> config upload -> FDT baseline
+ * -> no-finger reference frame -> arm finger detection -> wait for a
+ * touch (up to GOODIX533C_FINGER_WAIT_TIMEOUT_MS) -> live frame -> flat
+ * field. The reference frame's PGM is always written if captured, whether
+ * or not a finger was ever touched to the sensor; the flat-fielded
+ * "-live" PGM is only written if a touch was actually detected in time.
  */
 
 #include <errno.h>
 #include <stdio.h>
+#include <string.h>
 
 #include <glib.h>
 
@@ -46,6 +54,40 @@ write_pgm (const char *path, const guint8 *pixels, int width, int height)
   return n == (size_t) (width * height);
 }
 
+/* Derives "<stem>-live.pgm" from the reference-frame output path (e.g.
+ * "capture.pgm" -> "capture-live.pgm"), so a single positional argument
+ * on the command line still names both output files predictably. */
+static gchar *
+live_output_path (const char *reference_path)
+{
+  const char *dot = strrchr (reference_path, '.');
+
+  if (dot)
+    return g_strdup_printf ("%.*s-live%s", (int) (dot - reference_path),
+                           reference_path, dot);
+
+  return g_strdup_printf ("%s-live", reference_path);
+}
+
+static void
+print_pixel_range (const char *label, const guint16 *pixels, int count)
+{
+  guint16 min = 0xffff;
+  guint16 max = 0;
+  int i;
+
+  for (i = 0; i < count; i++)
+    {
+      if (pixels[i] < min)
+        min = pixels[i];
+      if (pixels[i] > max)
+        max = pixels[i];
+    }
+
+  g_print ("%s: %dx%d, raw pixel range [%u, %u]\n", label,
+           GOODIX533C_SENSOR_WIDTH, GOODIX533C_SENSOR_HEIGHT, min, max);
+}
+
 static void
 on_closed (FpDevice *dev, GAsyncResult *res, TestState *ts)
 {
@@ -61,42 +103,66 @@ on_closed (FpDevice *dev, GAsyncResult *res, TestState *ts)
 }
 
 static void
+on_wait_for_finger (FpDevice *dev, gpointer user_data)
+{
+  g_print ("Touch the sensor now (%ds)...\n",
+           GOODIX533C_FINGER_WAIT_TIMEOUT_MS / 1000);
+}
+
+static void
 on_capture_done (FpDevice *dev, const guint16 *raw_pixels,
-                 const guint8 *squashed, gpointer user_data, GError *error)
+                 const guint8 *squashed, const guint16 *live_raw_pixels,
+                 const guint8 *corrected, gpointer user_data, GError *error)
 {
   TestState *ts = user_data;
   int count = GOODIX533C_SENSOR_WIDTH * GOODIX533C_SENSOR_HEIGHT;
-  int i;
-  guint16 raw_min = 0xffff;
-  guint16 raw_max = 0;
+
+  /* Write whatever frames actually came back before looking at @error --
+   * a failure partway through (e.g. no finger touched within the
+   * timeout) must not throw away a reference frame that was already
+   * captured successfully earlier in the same sequence. */
+  if (raw_pixels && squashed)
+    {
+      print_pixel_range ("Reference frame", raw_pixels, count);
+
+      if (write_pgm (ts->output_path, squashed, GOODIX533C_SENSOR_WIDTH,
+                     GOODIX533C_SENSOR_HEIGHT))
+        g_print ("Wrote %s\n", ts->output_path);
+      else
+        {
+          g_print ("Failed to write %s\n", ts->output_path);
+          ts->exit_code = 1;
+        }
+    }
+  else
+    {
+      g_print ("No reference frame captured.\n");
+    }
+
+  if (live_raw_pixels && corrected)
+    {
+      g_autofree gchar *live_path = live_output_path (ts->output_path);
+
+      print_pixel_range ("Live frame", live_raw_pixels, count);
+
+      if (write_pgm (live_path, corrected, GOODIX533C_SENSOR_WIDTH,
+                     GOODIX533C_SENSOR_HEIGHT))
+        g_print ("Wrote %s (flat-fielded fingerprint)\n", live_path);
+      else
+        {
+          g_print ("Failed to write %s\n", live_path);
+          ts->exit_code = 1;
+        }
+    }
 
   if (error)
     {
-      g_print ("Capture FAILED: %s\n", error->message);
+      g_print ("Capture sequence FAILED: %s\n", error->message);
       ts->exit_code = 1;
-      fp_device_close (dev, NULL, (GAsyncReadyCallback) on_closed, ts);
-      return;
     }
-
-  for (i = 0; i < count; i++)
-    {
-      if (raw_pixels[i] < raw_min)
-        raw_min = raw_pixels[i];
-      if (raw_pixels[i] > raw_max)
-        raw_max = raw_pixels[i];
-    }
-
-  g_print ("Captured frame: %dx%d, raw pixel range [%u, %u]\n",
-           GOODIX533C_SENSOR_WIDTH, GOODIX533C_SENSOR_HEIGHT, raw_min,
-           raw_max);
-
-  if (write_pgm (ts->output_path, squashed, GOODIX533C_SENSOR_WIDTH,
-                 GOODIX533C_SENSOR_HEIGHT))
-    g_print ("Wrote %s\n", ts->output_path);
   else
     {
-      g_print ("Failed to write %s\n", ts->output_path);
-      ts->exit_code = 1;
+      g_print ("Capture sequence completed successfully.\n");
     }
 
   fp_device_close (dev, NULL, (GAsyncReadyCallback) on_closed, ts);
@@ -116,7 +182,8 @@ on_opened (FpDevice *dev, GAsyncResult *res, TestState *ts)
     }
 
   g_print ("open() SUCCEEDED\n");
-  fpi_device_goodix533c_capture_test (dev, on_capture_done, ts);
+  fpi_device_goodix533c_capture_test (dev, on_wait_for_finger,
+                                      on_capture_done, ts);
 }
 
 int
