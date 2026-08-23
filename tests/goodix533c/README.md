@@ -94,50 +94,77 @@ Python 3.8 predates the PEP 604/585 type-hint syntax the vendored
 re-running it, since a future finger-present capture (see "Deliberately
 finger-absent" above) will need the same mechanism.
 
-### Current open item: umockdev replay desync on the full-payload capture
+### Second bug found and fixed: bus/device-address mismatch
 
-`custom.pcapng` now carries genuinely complete payload data (confirmed
-above), but replaying it against the driver surfaces a **different,
-second problem**, not present with the old zero-payload capture:
+Replaying the payload-complete capture still hit the same-looking
+`umockdev-pcap.vala:158: Replay may be stuck: Reaping discard URB of type
+BULK, for endpoint 0x01 with length 64 without corresponding submit`
+message. Ruled out first (via `G_MESSAGES_DEBUG=all umockdev-run` plus
+`tools/decode_capture.py`/`tools/parse_capture.py`-based frame-by-frame
+comparison against the old capture): write ordering, `nop`'s
+cancelled-read pattern, root-hub traffic interleaving, `urb_id` reuse or
+collision (usbmon IDs are raw kernel pointers and get reused constantly
+in both captures -- confirmed harmless in both), and reply payload
+content itself (redacting every captured byte back to the old capture's
+all-zero shape, while keeping the same frame count/structure, still hung
+identically).
 
-```
-umockdev-pcap.vala:158: Replay may be stuck: Reaping discard URB of type
-BULK, for endpoint 0x01 with length 64 without corresponding submit
-```
+**Actual cause**: the VM capture recorded the sensor at `bus=1,
+device=2` (the VM's own USB topology), but `device` in this fixture still
+declares `busnum=3, devnum=6` (the *original* host capture's numbers,
+untouched since this fixture's very first version). umockdev's pcap
+replay apparently needs the trace's own recorded bus/device address to
+match what the mocked `device` file declares, or its submit/complete
+matching desyncs -- silently, with no error naming the actual mismatch.
+Relabeling every packet's `busnum`/`devnum` fields in the capture (a
+mechanical, structure-preserving rewrite -- see the note below) to 3/6
+fixed this completely: replay now proceeds correctly through the
+*entire* non-TLS open() sequence -- `nop`, `firmware_version`,
+`preset_psk_read`, `reset`, `read_sensor_register`, `read_otp`, and
+`request_tls_connection` all replay and decode exactly as captured.
 
-...followed by the same `Command timed out: 0xa8` outcome. Diagnostic
-work so far (with `G_MESSAGES_DEBUG=all umockdev-run ...`):
+### Third, structural limitation: TLS handshake replay is not fixable this way
 
-- The two captures are structurally near-identical for the whole
-  `nop`/`firmware_version` exchange -- same submit/complete ordering,
-  same cancelled-read pattern for `nop`'s tolerant no-reply timeout, same
-  write byte content. Replaying the *old* zero-payload capture against
-  the current driver build reproduces its originally-documented behavior
-  exactly (two `Unknown pack flags: 0x00` warnings, then the timeout) --
-  no "stuck"/discard message at all.
-- The divergence is therefore specifically triggered by the presence of
-  real, non-empty reply payload (the `firmware_version` reply now
-  arrives as a real `COMMAND_ACK` then real `COMMAND_FIRMWARE_VERSION`
-  data, versus two empty reads before) -- something in umockdev's own
-  URB submit/complete bookkeeping desyncs once there's real data to
-  track, rather than an ordering or content mismatch in the capture
-  itself.
-- Root-hub traffic interleaving (device address 1 vs the sensor's device
-  address 2) was ruled out as the cause -- filtering the capture to only
-  the sensor's own traffic (`usb.device_address == 2`) makes no
-  difference.
+With the bus/device fix in place, replay gets all the way to the TLS
+handshake before failing (`TLS handshake failed: transfer timed out`,
+plus one more "stuck" message). Traced directly through
+`libfprint/drivers/goodix533c/goodix533c.c`: `on_request_tls_connection_reply`
+takes the device's (replayed, real) ClientHello and feeds it into the
+driver's own embedded TLS server (`goodix_tls_client_write`, backed by a
+genuine `SSL_accept()` in `goodixtls.c`). `tls_handshake_run`'s first
+state, `TLS_STAGE_HELLO_S`, then reads that embedded server's own
+**freshly generated** `ServerHello` (`goodix_tls_client_read` -- new
+random values and a new ECDHE key pair every single run, exactly as real
+TLS requires) and sends *that* out over USB.
 
-**Not yet resolved.** `custom.py` is therefore left as-is (device
-discovery and feature-flag assertions only, `open_sync()` still not
-called) until this is understood -- re-enabling it on a capture that is
-known not to replay would trade a documented, honest gap for a silently
-broken test. `custom.pcapng` itself is worth keeping as-is regardless:
-it is the *complete, correct* protocol capture (confirmed byte-exact),
-which is what any future recapture would need to start from, and is
-already strictly more useful than the zero-payload version for anyone
-debugging this further (e.g. by decoding it with
-`tools/decode_capture.py`/`tools/parse_capture.py` in the parent
-project).
+This is not a umockdev bug, and not something a better capture or a
+smarter pcap edit can fix: the driver's outgoing TLS bytes are
+genuinely non-deterministic by design, so they can never byte-match (or
+even length-match) whatever a *previously recorded* session happened to
+produce. Static pcap replay is fundamentally the wrong tool for testing
+past this point without either mocking the TLS layer itself for tests
+(e.g. a deterministic PRNG hook, out of scope for a driver that must use
+real crypto in production) or having umockdev tolerate arbitrary
+OUT-direction content past a certain stage (not something this fixture
+controls).
+
+**Practical effect**: `custom.py` stays as-is (device discovery and
+feature-flag assertions only). `open_sync()` cannot be added back via
+this mechanism -- not because the fixture is incomplete, but because the
+open() sequence's TLS stage is inherently unreplayable this way. Anyone
+revisiting this should treat "get `open_sync()` passing under `custom.py`"
+as requiring a different testing strategy for the TLS portion specifically
+(e.g. stopping the umockdev-driven test at `request_tls_connection`,
+verified up through there now, rather than attempting a full `open()`),
+not as a capture-quality problem to keep chasing.
+
+**Note on the bus/device relabeling**: rewriting `busnum`/`devnum` is a
+simple in-place edit of each packet's usbmon capture header (`busnum` and
+`devnum` are literal fields in that header -- see the format doc at the
+top of `tools/parse_capture.py` in the parent project) and touches
+nothing else; it was verified afterward that every byte of payload data
+was still intact (`usb.data_len == usb.urb_len` for all 26 bulk-IN
+completions, 14835/14835 bytes total, same as before relabeling).
 
 ## Current scope and limitations
 
@@ -162,17 +189,20 @@ Accordingly `custom.py`:
   which is exactly what must not be committed, on top of the open()
   replay gap making it moot anyway.
 
-**Follow-up needed, in two independent stages:**
+**Follow-up needed:**
 
-1. **Resolve the umockdev replay desync described in "Replay status"
-   above.** The capture itself is no longer the blocker (it has complete
-   payload data, byte-verified); what's blocking is umockdev's own
-   submit/complete bookkeeping getting stuck partway through replaying
-   it. Once `custom.pcapng` replays cleanly end to end, add
-   `open_sync()`/`close_sync()` back into `custom.py` (removed from this
-   version because the fixture couldn't support them) and confirm they
-   pass.
-2. **Then, once SIGFM enroll/verify/identify work is complete**, extend
+1. **Add a scoped replay test that stops before TLS.** `custom.pcapng`
+   now replays correctly through the entire non-TLS open() sequence (see
+   "Replay status" above) -- `nop` through `request_tls_connection` all
+   decode exactly as captured. A test that exercises up through there
+   (rather than a full `open_sync()`, which requires the TLS stage to
+   also replay -- structurally not possible per "Third, structural
+   limitation" above) would be genuine, valuable coverage this fixture
+   can actually support today. This likely needs a small test-only entry
+   point in the driver (there's already a precedent:
+   `goodix533c-capture-test`), since `FpDevice`'s public API doesn't
+   expose a way to stop mid-open().
+2. **Once SIGFM enroll/verify/identify work is complete**, extend
    `custom.py` (or add a second fixture-specific test file) to drive
    `enroll_sync()`/`verify_sync()`/`identify_sync()`, modeled on
    `tests/fpcmoc/custom.py` or `tests/elanmoc/custom.py` (both
