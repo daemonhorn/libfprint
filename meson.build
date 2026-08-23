@@ -125,12 +125,18 @@ default_drivers = [
     'upekts',
     'goodixmoc',
     'goodixtls511',
-    'goodix533c',
     'nb1010',
     'fpcmoc',
 
     # SPI
     'elanspi',
+]
+
+# Not in default_drivers: pulls in OpenCV (see driver_helper_mapping's
+# 'sigfm' helper below), which the rest of default_drivers does not
+# require. Opt in explicitly with -Ddrivers=goodix533c or -Ddrivers=all.
+all_drivers_only = [
+    'goodix533c',
 ]
 
 # FIXME: All the drivers should be fixed by adjusting the byte order.
@@ -140,7 +146,7 @@ endian_independent_drivers = virtual_drivers + [
     'synaptics',
 ]
 
-all_drivers = default_drivers + virtual_drivers
+all_drivers = default_drivers + virtual_drivers + all_drivers_only
 
 if drivers == [ 'all' ]
     drivers = all_drivers

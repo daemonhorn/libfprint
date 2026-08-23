@@ -484,11 +484,18 @@ cmd_preset_psk_read (FpDevice *dev, guint32 flags, guint32 length,
                      gpointer user_data)
 {
   guint8 payload[16];
+  guint32 length_le = GUINT32_TO_LE (length);
+  guint32 offset_le = GUINT32_TO_LE (offset);
+  guint32 flags_le = GUINT32_TO_LE (flags);
+  guint32 zero_le = GUINT32_TO_LE (0);
 
-  *(guint32 *) (payload + 0) = GUINT32_TO_LE (length);
-  *(guint32 *) (payload + 4) = GUINT32_TO_LE (offset);
-  *(guint32 *) (payload + 8) = GUINT32_TO_LE (flags);
-  *(guint32 *) (payload + 12) = GUINT32_TO_LE (0);
+  /* payload isn't guaranteed 4-byte aligned, so store via memcpy rather
+   * than an unaligned guint32* cast (UB, and a real SIGBUS risk on
+   * strict-alignment architectures). */
+  memcpy (payload + 0, &length_le, sizeof (length_le));
+  memcpy (payload + 4, &offset_le, sizeof (offset_le));
+  memcpy (payload + 8, &flags_le, sizeof (flags_le));
+  memcpy (payload + 12, &zero_le, sizeof (zero_le));
 
   send_protocol (dev, GOODIX_CMD_PRESET_PSK_READ, payload, sizeof (payload),
                  TRUE, GOODIX533C_TIMEOUT_MS, TRUE, TRUE, callback,
@@ -515,9 +522,10 @@ cmd_read_sensor_register (FpDevice *dev, guint16 address, guint8 length,
                           Goodix533cCmdCallback callback, gpointer user_data)
 {
   guint8 payload[4];
+  guint16 address_le = GUINT16_TO_LE (address);
 
   payload[0] = 0x00;
-  *(guint16 *) (payload + 1) = GUINT16_TO_LE (address);
+  memcpy (payload + 1, &address_le, sizeof (address_le));
   payload[3] = length;
 
   send_protocol (dev, GOODIX_CMD_READ_SENSOR_REGISTER, payload,
@@ -531,9 +539,10 @@ cmd_write_sensor_register (FpDevice *dev, guint16 address,
                            Goodix533cCmdCallback callback, gpointer user_data)
 {
   guint8 payload[5];
+  guint16 address_le = GUINT16_TO_LE (address);
 
   payload[0] = 0x00;
-  *(guint16 *) (payload + 1) = GUINT16_TO_LE (address);
+  memcpy (payload + 1, &address_le, sizeof (address_le));
   payload[3] = value[0];
   payload[4] = value[1];
 
@@ -1901,7 +1910,15 @@ on_open_psk_read_reply (FpDevice *dev, guint8 *data, guint16 length,
       return;
     }
 
-  psk_length = GUINT32_FROM_LE (*(guint32 *) (data + 5));
+  {
+    guint32 psk_length_le;
+
+    /* data+5 isn't guaranteed 4-byte aligned; memcpy avoids the unaligned
+     * guint32* cast (UB, and a real SIGBUS risk on strict-alignment
+     * architectures). */
+    memcpy (&psk_length_le, data + 5, sizeof (psk_length_le));
+    psk_length = GUINT32_FROM_LE (psk_length_le);
+  }
   if (length < 9 + psk_length)
     {
       fpi_ssm_mark_failed (ssm, g_error_new (G_IO_ERROR, G_IO_ERROR_FAILED,

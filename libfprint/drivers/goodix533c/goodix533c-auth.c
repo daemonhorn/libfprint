@@ -52,7 +52,20 @@
 static gboolean
 goodix533c_match_scores_need_exhaustive_logging (void)
 {
+#if GLIB_VERSION_MAX_ALLOWED >= GLIB_VERSION_2_68
   return !g_log_writer_default_would_drop (G_LOG_LEVEL_DEBUG, G_LOG_DOMAIN);
+#else
+  /* g_log_writer_default_would_drop() is 2.68+; this project pins
+   * GLIB_VERSION_MAX_ALLOWED to its declared floor of 2.56 (see
+   * glib_min_version in meson.build), regardless of the glib actually
+   * installed on the build machine -- so gate on that macro, not
+   * GLIB_CHECK_VERSION (which reflects the build machine's headers and
+   * would silently produce a binary that needs a newer runtime glib than
+   * the project claims to support). Below 2.68 there is no cheap way to
+   * ask in advance whether debug logging would be dropped, so just
+   * always do the exhaustive per-candidate logging. */
+  return TRUE;
+#endif
 }
 
 static gboolean
