@@ -142,7 +142,10 @@ driver_sources = {
     'goodixtls511' :
         [ 'drivers/goodixtls/goodix511.c' ],
     'goodix533c' :
-        [ 'drivers/goodix533c/goodix533c.c' ],
+        [ 'drivers/goodix533c/goodix533c.c',
+          'drivers/goodix533c/goodix533c-match.c',
+          'drivers/goodix533c/goodix533c-enroll.c',
+          'drivers/goodix533c/goodix533c-auth.c' ],
     'fpcmoc' :
         [ 'drivers/fpcmoc/fpc.c' ],
 }
@@ -159,6 +162,8 @@ helper_sources = {
     'nss' :
         [ ],
     'udev' :
+        [ ],
+    'sigfm' :
         [ ],
     'virtual' :
         [ 'drivers/virtual-device-listener.c' ],
@@ -261,15 +266,31 @@ libfprint_private = static_library('fprint-private',
     link_with: libnbis,
     install: false)
 
+# libsigfm (declared in the top-level meson.build, only when a driver that
+# needs it -- currently just goodix533c -- is enabled) has to be linked
+# wherever driver code that calls into it ends up: the static driver
+# archive, the final shared library, and (via libfprint_private_dep below)
+# every executable that links libfprint_drivers directly, such as
+# goodix533c-capture-test and fprint-list-udev-hwdb.
+libfprint_drivers_link_with = [libfprint_private]
+if have_sigfm
+    libfprint_drivers_link_with += libsigfm
+endif
+
 libfprint_drivers = static_library('fprint-drivers',
     sources: drivers_sources,
     c_args: drivers_cflags,
     dependencies: deps,
-    link_with: libfprint_private,
+    link_with: libfprint_drivers_link_with,
     install: false)
 
 mapfile = files('libfprint.ver')
 vflag = '-Wl,--version-script,@0@/@1@'.format(meson.source_root(), mapfile[0])
+
+libfprint_link_with = [libfprint_drivers, libfprint_private]
+if have_sigfm
+    libfprint_link_with += libsigfm
+endif
 
 libfprint = shared_library(versioned_libname.split('lib')[1],
     sources: [
@@ -280,7 +301,7 @@ libfprint = shared_library(versioned_libname.split('lib')[1],
     version: libversion,
     link_args : vflag,
     link_depends : mapfile,
-    link_with: [libfprint_drivers, libfprint_private],
+    link_with: libfprint_link_with,
     dependencies: deps,
     install: true)
 
@@ -298,9 +319,14 @@ install_headers(['fprint.h'] + libfprint_public_headers,
     subdir: versioned_libname
 )
 
+libfprint_private_dep_link_with = [libfprint_private]
+if have_sigfm
+    libfprint_private_dep_link_with += libsigfm
+endif
+
 libfprint_private_dep = declare_dependency(
     include_directories: include_directories('.'),
-    link_with: libfprint_private,
+    link_with: libfprint_private_dep_link_with,
     dependencies: [
         deps,
         libfprint_dep,
