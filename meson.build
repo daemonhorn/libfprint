@@ -125,6 +125,7 @@ default_drivers = [
     'upekts',
     'goodixmoc',
     'goodixtls511',
+    'goodix533c',
     'nb1010',
     'fpcmoc',
 
@@ -160,6 +161,7 @@ driver_helper_mapping = {
     'uru4000' : [ 'nss' ],
     'elanspi' : [ 'udev' ],
     'goodixtls511' : [ 'goodixtls' ],
+    'goodix533c' : [ 'goodixtls' ],
     'virtual_image'          : [ 'virtual' ],
     'virtual_device'         : [ 'virtual' ],
     'virtual_device_storage' : [ 'virtual' ],

@@ -141,6 +141,8 @@ driver_sources = {
         [ 'drivers/goodixmoc/goodix.c', 'drivers/goodixmoc/goodix_proto.c' ],
     'goodixtls511' :
         [ 'drivers/goodixtls/goodix511.c' ],
+    'goodix533c' :
+        [ 'drivers/goodix533c/goodix533c.c' ],
     'fpcmoc' :
         [ 'drivers/fpcmoc/fpc.c' ],
 }
@@ -304,6 +306,14 @@ libfprint_private_dep = declare_dependency(
         libfprint_dep,
     ]
 )
+
+if 'goodix533c' in drivers
+    goodix533c_capture_test = executable('goodix533c-capture-test',
+        'drivers/goodix533c/capture_test.c',
+        dependencies: libfprint_private_dep,
+        link_with: libfprint_drivers,
+        install: false)
+endif
 
 udev_hwdb = executable('fprint-list-udev-hwdb',
     'fprint-list-udev-hwdb.c',
