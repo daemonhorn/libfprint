@@ -19,7 +19,7 @@ moved -- the original is left in place.
 - `custom.py` -- driven by `tests/umockdev-test.py` (invoked via `meson
   test`), exercises device discovery and feature-flag assertions against
   the replayed session. It deliberately stops there and does not call
-  `open_sync()` -- see "Verified replay result" below for why.
+  `open_sync()` -- see "Replay status" below for why.
 
 ## Deliberately finger-absent
 
@@ -38,81 +38,106 @@ driver now, but nothing in this fixture can safely exercise them). Any
 such fixture must be captured and vetted by a human outside of an
 automated agent, exactly as this one was.
 
-## Verified replay result (important -- read before trusting this fixture)
+## Replay status (important -- read before trusting this fixture)
 
-Replaying `custom.pcapng` against the real, currently-built `goodix533c`
-driver (both directly via the `goodix533c-capture-test` binary, and via
-`custom.py`/`meson test`) was checked while adding this fixture to this
-submodule. It does **not** get as far as the protocol summary above
-implies. Concretely:
+### The original zero-payload bug: root cause found, and fixed
 
-```sh
-$ umockdev-run -d device \
-    -p /sys/devices/pci0000:00/0000:00:14.0/usb3/3-3=custom.pcapng \
-    -- .../builddir/libfprint/goodix533c-capture-test
-Found: 0 (Goodix 27c6:533c Fingerprint Sensor) - driver goodix533c
-Opening 0 ...
+The first cut of this fixture (still the version described in stale form
+below until this section was rewritten) could not replay past the
+driver's second open() command (`0xa8`, `GOODIX_CMD_FIRMWARE_VERSION`):
+every bulk-IN (`0x83`) completion in the capture had `usb.data_len == 0`
+despite `usb.urb_len` correctly reporting the real transfer size --
+metadata preserved, payload always redacted. Tool choice was
+conclusively ruled out first: `tools/recapture_fixture_dumpcap.sh` in the
+parent project captures via `dumpcap` directly (bypassing tshark's
+wrapper) and reproduces the *identical* symptom, including on the
+14,338-byte real image-transfer frame.
 
-(process:NNNNN): libfprint-goodix533c-WARNING **: Unknown pack flags: 0x00
+**Root cause: Linux kernel lockdown mode (`confidentiality`), which
+redacts USB payload capture system-wide, including for root.** Confirmed
+directly on the host that produced every earlier attempt:
 
-(process:NNNNN): libfprint-goodix533c-WARNING **: Unknown pack flags: 0x00
-open() FAILED: Command timed out: 0xa8
+- `cat /sys/kernel/security/lockdown` reports `none [integrity]
+  confidentiality` -- confidentiality mode active.
+- The usbmon **text** interface (`/sys/kernel/debug/usb/usbmon/<N>u`)
+  returns `Operation not permitted` (EPERM) even as root -- the kernel's
+  `LOCKDOWN_USB` restriction blocking a debugfs interface outright, not a
+  DAC permission issue (root bypasses DAC; it cannot bypass a lockdown
+  LSM check).
+- The usbmon **binary** interface (what both `tshark` and `dumpcap` use)
+  stays readable, but has its captured-data length forced to 0 on every
+  bulk-IN completion for this device, while `urb_len` (the real transfer
+  size) stays correct -- exactly the "metadata preserved, payload
+  redacted" shape `LOCKDOWN_USB` produces, and exactly what both tool
+  choices independently reproduced.
+
+This is intentional kernel behavior (typically auto-enabled by Secure
+Boot), not a bug in the driver, the test harness, or any capture tool --
+and not something to work around by changing lockdown/Secure Boot
+settings on a real machine.
+
+**Fix: capture from inside a VM whose guest kernel has no lockdown
+enabled.** The physical sensor was passed through via QEMU
+(`-device usb-host,vendorid=0x27c6,productid=0x533c`) to the existing
+`vm/` Ubuntu 20.04 cloud image (already used earlier in this project for
+a different capture, see `findings/vm-capture-analysis.md`), running the
+same finger-absent `capture_fixture_session.py` inside the guest while
+`tshark` captured on the guest's own `usbmonN`. Verified byte-exact:
+every one of the 26 bulk-IN completions in the resulting capture has
+`usb.data_len == usb.urb_len`, summing to 14,835/14,835 bytes across the
+whole session, including the full 14,338-byte encrypted image-capture
+frame. The reusable capture script is
+`vm/usbmon-capture-in-vm.sh` in the parent project (plus a small
+`vm/patch_future_annotations.py` helper, needed because the VM's stock
+Python 3.8 predates the PEP 604/585 type-hint syntax the vendored
+`goodix-fp-dump-nikicat` driver uses) -- read its header comment before
+re-running it, since a future finger-present capture (see "Deliberately
+finger-absent" above) will need the same mechanism.
+
+### Current open item: umockdev replay desync on the full-payload capture
+
+`custom.pcapng` now carries genuinely complete payload data (confirmed
+above), but replaying it against the driver surfaces a **different,
+second problem**, not present with the old zero-payload capture:
+
+```
+umockdev-pcap.vala:158: Replay may be stuck: Reaping discard URB of type
+BULK, for endpoint 0x01 with length 64 without corresponding submit
 ```
 
-`0xa8` is `GOODIX_CMD_FIRMWARE_VERSION`, the *second* command the driver's
-open() sequence sends (after `nop`, whose reply -- or lack of one -- the
-driver already tolerates). Under the standard `meson test` driver-test
-harness, which sets `G_DEBUG=fatal-warnings`, the same underlying
-condition instead aborts the process with `SIGTRAP` on the "Unknown pack
-flags: 0x00" warning rather than reaching the timeout message, because
-that warning becomes fatal.
+...followed by the same `Command timed out: 0xa8` outcome. Diagnostic
+work so far (with `G_MESSAGES_DEBUG=all umockdev-run ...`):
 
-Root cause, confirmed with `tshark`'s decoded USB URB fields (not just a
-manual hex read) across the *entire* capture file: every completion event
-on the fingerprint device's (bus 3, address 6) bulk-IN endpoint (address
-`0x83`) has `usb.data_len == 0` -- i.e. **no bulk-IN reply payload was
-ever captured for this device, anywhere in this file**, even though every
-outgoing bulk-OUT request was captured in full (including the later-stage
-TLS ClientHello/PSK and config-upload writes -- confirmed via
-`usb.endpoint_address.direction` to genuinely be host-to-device, not
-misattributed replies) and the control-endpoint (EP0) enumeration traffic
-has real payload. This holds for every command, not just
-firmware_version -- firmware_version simply happens to be the first
-command in open() that actually requires a substantive reply (`nop`'s
-reply is optional by design).
+- The two captures are structurally near-identical for the whole
+  `nop`/`firmware_version` exchange -- same submit/complete ordering,
+  same cancelled-read pattern for `nop`'s tolerant no-reply timeout, same
+  write byte content. Replaying the *old* zero-payload capture against
+  the current driver build reproduces its originally-documented behavior
+  exactly (two `Unknown pack flags: 0x00` warnings, then the timeout) --
+  no "stuck"/discard message at all.
+- The divergence is therefore specifically triggered by the presence of
+  real, non-empty reply payload (the `firmware_version` reply now
+  arrives as a real `COMMAND_ACK` then real `COMMAND_FIRMWARE_VERSION`
+  data, versus two empty reads before) -- something in umockdev's own
+  URB submit/complete bookkeeping desyncs once there's real data to
+  track, rather than an ordering or content mismatch in the capture
+  itself.
+- Root-hub traffic interleaving (device address 1 vs the sensor's device
+  address 2) was ruled out as the cause -- filtering the capture to only
+  the sensor's own traffic (`usb.device_address == 2`) makes no
+  difference.
 
-This finding was cross-checked with a control, since it's a strong claim
-about an existing, already-vetted fixture: the same query
-(`usb.endpoint_address==0x83 && usb.data_len>0`) against
-`tests/goodixmoc/custom.pcapng` (a single-device capture with no bus
-noise, known-good in upstream CI) returns 124 hits on its own endpoint
-`0x83`, confirming both that the methodology correctly detects real
-captured payload when present, and that a genuinely-replayable fixture
-does carry it throughout. `goodix533c/custom.pcapng` returns 0 hits on
-the same query, restricted to its own device's address (6) to exclude
-unrelated bus traffic from another USB device (a Bluetooth adapter,
-address 4) and the root hub (address 1) that happen to share the same
-capture window.
-
-That the driver's outgoing requests visibly *progress* through the whole
-open() sequence in this capture (firmware_version, PSK read, reset, chip
-ID/OTP reads, then a multi-packet TLS ClientHello/PSK and config-upload
-write sequence) shows the real hardware genuinely replied at each stage
-during the original live session -- otherwise the driver could never
-have gotten far enough to send those later commands. What's missing is
-specifically the *captured* reply payload, i.e. a property of how this
-file was recorded, not of what happened on the wire when it was recorded.
-
-**Practical effect on `custom.py`**: it does not call `open_sync()` (or
-anything past it) at all, precisely because of this gap -- see the file
-for the reasoning inline. It only asserts device discovery and feature
-flags, which are fully verifiable against this fixture. `meson test`'s
-`goodix533c` entry is expected to PASS with that reduced scope. A
-previous draft of this fixture called `open_sync()`/`close_sync()`
-unconditionally and documented the resulting failure instead of avoiding
-it; that was reverted in favor of keeping the suite green and putting the
-gap here, in the README, and in the task report instead of in a
-permanently-red test.
+**Not yet resolved.** `custom.py` is therefore left as-is (device
+discovery and feature-flag assertions only, `open_sync()` still not
+called) until this is understood -- re-enabling it on a capture that is
+known not to replay would trade a documented, honest gap for a silently
+broken test. `custom.pcapng` itself is worth keeping as-is regardless:
+it is the *complete, correct* protocol capture (confirmed byte-exact),
+which is what any future recapture would need to start from, and is
+already strictly more useful than the zero-payload version for anyone
+debugging this further (e.g. by decoding it with
+`tools/decode_capture.py`/`tools/parse_capture.py` in the parent
+project).
 
 ## Current scope and limitations
 
@@ -139,14 +164,13 @@ Accordingly `custom.py`:
 
 **Follow-up needed, in two independent stages:**
 
-1. **Fix the replay gap first.** A corrected `custom.pcapng` (or a
-   replacement fixture) is needed that retains bulk-IN reply payload
-   data -- still finger-absent, still stopping before any live
-   `mcu_get_image` reply, just captured with a method that doesn't drop
-   the device's response bytes. Once that exists, add
-   `open_sync()`/`close_sync()` back into `custom.py` (they were removed
-   from this version specifically because the current fixture can't
-   support them -- see "Verified replay result" above) and confirm they
+1. **Resolve the umockdev replay desync described in "Replay status"
+   above.** The capture itself is no longer the blocker (it has complete
+   payload data, byte-verified); what's blocking is umockdev's own
+   submit/complete bookkeeping getting stuck partway through replaying
+   it. Once `custom.pcapng` replays cleanly end to end, add
+   `open_sync()`/`close_sync()` back into `custom.py` (removed from this
+   version because the fixture couldn't support them) and confirm they
    pass.
 2. **Then, once SIGFM enroll/verify/identify work is complete**, extend
    `custom.py` (or add a second fixture-specific test file) to drive
@@ -158,35 +182,10 @@ Accordingly `custom.py`:
    `mcu_get_image` replies -- which, per the constraint above, must be
    captured and safety-reviewed by a human, never generated by an agent,
    and only committed if the human is certain they're comfortable with
-   those frames being third-party-decryptable (the PSK is public).
-
-Neither of the two new captures described above were made as part of
-adding this fixture.
-
-**Snaplen ruled out as the cause.** After this fixture was added, two
-fresh finger-absent recapture attempts were made (via
-`capture_fixture_session.py`, same safe no-finger-only script, using
-`tshark -i usbmon3 -s 0 ...` and then `-s 65535 ...` -- explicit
-unlimited and explicit-large snap lengths respectively) specifically to
-test whether a truncated capture snaplen was the cause. Both attempts
-reproduced the exact same result: every bulk-IN (`0x83`) completion
-event capped at exactly 64 bytes total frame length with 0 bytes of
-captured payload, identical to the original fixture. Raw hex inspection
-of one such frame (`tshark -x`) confirms the 64 bytes are consumed
-entirely by usbmon's own binary capture header, with no payload bytes
-attached at all -- not a truncated-but-present payload, a genuinely
-absent one. This means the gap is not a tshark/dumpcap snaplen flag
-issue; the actual cause is some other property of how `usbmon`'s
-binary interface is capturing (or not capturing) this device's
-bulk-IN completions on this system/kernel, not yet identified. Both
-recapture attempts were deleted (they added no value and, being
-finger-absent, carried no sensitivity, but there was no reason to keep
-them). Whoever picks up "fix the replay gap" next should start by
-ruling out something other than snaplen -- e.g. usbmon's ring buffer
-size (`/sys/kernel/debug/usb/usbmon/` / `MON_IOCT_RING_SIZE`), a
-`usbmon0u` text-mode capture as a simpler diagnostic cross-check, or
-capturing via `dumpcap` directly instead of through `tshark`'s
-wrapper.
+   those frames being third-party-decryptable (the PSK is public). Use
+   `vm/usbmon-capture-in-vm.sh` (parent project) for the underlying
+   capture mechanism -- it's the only one confirmed to retain full
+   payload data on a lockdown-enabled host.
 
 ## Replay
 
