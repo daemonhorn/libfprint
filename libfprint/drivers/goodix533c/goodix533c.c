@@ -32,6 +32,9 @@
 #include "../goodixtls/goodixtls.h"
 
 #include "goodix533c.h"
+#include "goodix533c-private.h"
+#include "goodix533c-enroll.h"
+#include "goodix533c-auth.h"
 
 /* ---- device-level constants (all hardware-verified, see
  * findings/native-driver-architecture.md) ---- */
@@ -83,9 +86,10 @@ static const guint8 capture_off[2] = { 0x0a, 0x02 };
 #define GOODIX533C_CMD_MCU_SWITCH_TO_SLEEP_MODE (0x60)
 
 /* FDT command prefixes -- fixed 2-byte prefix, each suffixed with the same
- * 24-byte per-session template read during CAPTURE_STAGE_FDT_BASELINE.
- * fdt_mode_idle (above) is the fourth member of this family, used with 24
- * zero bytes to *measure* the template; these three arm/query it. */
+ * 24-byte per-session template read during OPEN_STAGE_FDT_BASELINE (see
+ * open_run() further down). fdt_mode_idle (above) is the fourth member of
+ * this family, used with 24 zero bytes to *measure* the template; these
+ * three arm/query it. */
 static const guint8 fdt_mode_armed[2] = { 0x8d, 0x01 };
 static const guint8 fdt_down_armed[2] = { 0x0c, 0x01 };
 static const guint8 fdt_up_armed[2] = { 0x0e, 0x01 };
@@ -139,52 +143,6 @@ static const guint8 device_config[256] = {
   (GOODIX533C_SENSOR_WIDTH * GOODIX533C_SENSOR_HEIGHT * 3 / 2)
 #define GOODIX533C_IMAGE_PIXELS \
   (GOODIX533C_SENSOR_WIDTH * GOODIX533C_SENSOR_HEIGHT)
-
-/* ---- generic single-in-flight command callback shape, ported from
- * goodix.c's GoodixCmdCallback ---- */
-typedef void (*Goodix533cCmdCallback)(FpDevice *dev,
-                                      guint8   *data,
-                                      guint16   length,
-                                      gpointer  user_data,
-                                      GError   *error);
-
-struct _FpiDeviceGoodix533c
-{
-  FpDevice      parent_instance;
-
-  GCancellable *transfer_cancel_tkn;
-  gboolean      interface_claimed;
-  gboolean      read_loop_started;
-
-  /* reassembly buffer for the current incoming pack */
-  guint8       *rx_buf;
-  guint32       rx_len;
-
-  /* in-flight command state -- single command at a time, exactly like
-   * goodix.c's FpiDeviceGoodixTlsPrivate */
-  guint8                cmd;
-  gboolean              ack_pending;
-  gboolean              reply_pending;
-  GSource              *timeout_src;
-  Goodix533cCmdCallback callback;
-  gpointer              user_data;
-
-  /* embedded TLS-PSK server -- goodixtls.c, unmodified */
-  GoodixTlsServer tls;
-  gboolean        tls_active;
-
-  /* per-session FDT baseline, read fresh every open per the findings doc;
-   * appended (with a distinct fixed prefix) to every FDT arm/query
-   * command below. */
-  guint8   fdt_template[24];
-  gboolean have_fdt_template;
-
-  /* no-finger reference frame, kept around (not just handed to a callback
-   * and discarded) so a later live-frame capture in the same session can
-   * flat-field against it without re-measuring. */
-  guint16  *reference_pixels;
-  gboolean  have_reference;
-};
 
 G_DEFINE_TYPE (FpiDeviceGoodix533c, fpi_device_goodix533c, FP_TYPE_DEVICE)
 
@@ -1003,58 +961,29 @@ squash_frame_linear (const guint16 *frame, guint8 *squashed, guint32 count)
 }
 
 /* ===========================================================================
- * Capture sequence -- new code, following capture_golden_session.py /
- * driver_53xc.py's run_driver() exactly: reset through the no-finger
- * reference frame, then sleep/query -> arm finger detection -> wait for a
- * touch -> live (finger-present) frame -> flat-field the live frame
- * against the reference. One continuous FpiSsm, not two -- see the FDT
- * arm/wait/capture stages appended below CAPTURE_STAGE_CAPTURE_OFF.
+ * Capture building blocks -- ported logic from capture_golden_session.py /
+ * driver_53xc.py's run_driver(), refactored into reusable sub-SSMs.
+ *
+ * The original single-shot sequence (reset through the no-finger reference
+ * frame, sleep/query, arm finger detection, wait for a touch, live frame,
+ * flat-field against the reference) is split along a session-scoped vs.
+ * attempt-scoped line:
+ *
+ *  - Session-scoped (reset through FDT baseline measurement) now lives in
+ *    open_run() below -- it must only happen once per fp_device_open()
+ *    session, not once per enroll/verify attempt, or enroll would mean 8
+ *    full USB re-handshakes instead of 8 fast touches.
+ *  - Attempt-scoped (reference capture, finger wait, live capture, finger
+ *    up) becomes four sub-SSM starter functions
+ *    (goodix533c_start_{ref_capture,finger_wait,live_capture,finger_up}_subsm(),
+ *    declared in goodix533c-private.h), each usable as a child of any
+ *    parent SSM via fpi_ssm_start_subsm(). fpi_device_goodix533c_capture_test()
+ *    below chains all four for the standalone test harness;
+ *    goodix533c-enroll.c and goodix533c-auth.c each chain them their own way
+ *    (enroll repeats all four up to GOODIX533C_ENROLL_SAMPLES times; auth
+ *    runs the sequence once, replacing "finger up" cleanup with a match
+ *    step in between).
  * ======================================================================= */
-
-enum capture_stage {
-  CAPTURE_STAGE_RESET,
-  CAPTURE_STAGE_READ_CHIP_ID,
-  CAPTURE_STAGE_READ_OTP,
-  CAPTURE_STAGE_TLS,
-  CAPTURE_STAGE_UPLOAD_CONFIG,
-  CAPTURE_STAGE_FDT_BASELINE,
-  CAPTURE_STAGE_CAPTURE_ON,       /* reference frame, no finger */
-  CAPTURE_STAGE_GET_IMAGE,
-  CAPTURE_STAGE_CAPTURE_OFF,
-  CAPTURE_STAGE_SLEEP,
-  CAPTURE_STAGE_QUERY_MCU_STATE,
-  CAPTURE_STAGE_FDT_ARM_DOWN,
-  CAPTURE_STAGE_WAIT_FOR_FINGER,
-  CAPTURE_STAGE_FDT_MODE_ARM,
-  CAPTURE_STAGE_CAPTURE_ON_LIVE,  /* live (finger-present) frame */
-  CAPTURE_STAGE_GET_IMAGE_LIVE,
-  CAPTURE_STAGE_CAPTURE_OFF_LIVE,
-  CAPTURE_STAGE_FDT_UP,
-  CAPTURE_STAGE_NUM,
-};
-
-typedef struct
-{
-  Goodix533cProgressFunc    wait_for_finger_cb;
-  Goodix533cCaptureDoneFunc callback;
-  gpointer                  user_data;
-
-  guint16                  *raw_pixels;       /* reference frame */
-  guint8                   *squashed;
-
-  guint16                  *live_raw_pixels;  /* live frame */
-  guint8                   *corrected;        /* flat-fielded + squashed */
-} CaptureData;
-
-static void
-capture_data_free (CaptureData *data)
-{
-  g_free (data->raw_pixels);
-  g_free (data->squashed);
-  g_free (data->live_raw_pixels);
-  g_free (data->corrected);
-  g_free (data);
-}
 
 static void
 on_capture_step_reply (FpDevice *dev, guint8 *data, guint16 length,
@@ -1153,7 +1082,8 @@ on_fdt_baseline_reply (FpDevice *dev, guint8 *data, guint16 length,
    * template -- see fdt_template() in driver_53xc.py. Appended (with a
    * distinct fixed 2-byte prefix) to every later FDT arm/query command in
    * this same session -- see fdt_mode_armed/fdt_down_armed/fdt_up_armed
-   * above and their use in capture_run() below. */
+   * above and their use in the sub-SSM handlers below (finger_wait_ssm_handler,
+   * finger_up_ssm_handler). */
   /* Sample count: driver_53xc.py's fdt_template() computes this as
    * len(range(4, length - 1, 2)), which looks off-by-one against the
    * naive (length - 4) / 2 used below at first glance, but is not --
@@ -1249,16 +1179,20 @@ decode_get_image_reply (FpiDeviceGoodix533c *self, guint8 *data,
   return TRUE;
 }
 
+/**
+ * on_ref_get_image_reply: GET_IMAGE reply handler for the no-finger
+ * reference capture. Stores the decoded raw12 frame into
+ * self->reference_pixels, replacing whatever the previous attempt (or
+ * open() session) left there -- each enroll stage / verify attempt
+ * re-measures its own fresh reference immediately before its live capture.
+ */
 static void
-on_get_image_reply (FpDevice *dev, guint8 *data, guint16 length,
-                    gpointer user_data, GError *error)
+on_ref_get_image_reply (FpDevice *dev, guint8 *data, guint16 length,
+                        gpointer user_data, GError *error)
 {
   FpiSsm *ssm = user_data;
   FpiDeviceGoodix533c *self = FPI_DEVICE_GOODIX533C (dev);
-  CaptureData *cap = fpi_ssm_get_data (ssm);
-  gboolean live = fpi_ssm_get_cur_state (ssm) == CAPTURE_STAGE_GET_IMAGE_LIVE;
   guint16 *raw_pixels = NULL;
-  guint8 *squashed = NULL;
   GError *decode_error = NULL;
 
   if (error)
@@ -1267,31 +1201,51 @@ on_get_image_reply (FpDevice *dev, guint8 *data, guint16 length,
       return;
     }
 
-  if (!decode_get_image_reply (self, data, length, &raw_pixels,
-                               live ? NULL : &squashed, &decode_error))
+  if (!decode_get_image_reply (self, data, length, &raw_pixels, NULL,
+                               &decode_error))
     {
       fpi_ssm_mark_failed (ssm, decode_error);
       return;
     }
 
-  if (live)
-    {
-      cap->live_raw_pixels = raw_pixels;
-    }
-  else
-    {
-      cap->raw_pixels = raw_pixels;
-      cap->squashed = squashed;
+  g_clear_pointer (&self->reference_pixels, g_free);
+  self->reference_pixels = raw_pixels;
+  self->have_reference = TRUE;
 
-      /* Keep a copy in the driver's private struct (not just handed to
-       * the callback) so the live-frame stages further down this same
-       * SSM can flat-field against it without re-measuring. */
-      g_clear_pointer (&self->reference_pixels, g_free);
-      self->reference_pixels = g_new (guint16, GOODIX533C_IMAGE_PIXELS);
-      memcpy (self->reference_pixels, raw_pixels,
-             GOODIX533C_IMAGE_PIXELS * sizeof (guint16));
-      self->have_reference = TRUE;
+  fpi_ssm_next_state (ssm);
+}
+
+/**
+ * on_live_get_image_reply: GET_IMAGE reply handler for the live
+ * (finger-present) capture. Stores the decoded raw12 frame into
+ * self->live_raw_pixels -- flat-fielding against the reference and
+ * computing the clipped-fraction quality metric happens later, in the
+ * live-capture sub-SSM's PROCESS state, not here.
+ */
+static void
+on_live_get_image_reply (FpDevice *dev, guint8 *data, guint16 length,
+                         gpointer user_data, GError *error)
+{
+  FpiSsm *ssm = user_data;
+  FpiDeviceGoodix533c *self = FPI_DEVICE_GOODIX533C (dev);
+  guint16 *raw_pixels = NULL;
+  GError *decode_error = NULL;
+
+  if (error)
+    {
+      fpi_ssm_mark_failed (ssm, error);
+      return;
     }
+
+  if (!decode_get_image_reply (self, data, length, &raw_pixels, NULL,
+                               &decode_error))
+    {
+      fpi_ssm_mark_failed (ssm, decode_error);
+      return;
+    }
+
+  g_clear_pointer (&self->live_raw_pixels, g_free);
+  self->live_raw_pixels = raw_pixels;
 
   fpi_ssm_next_state (ssm);
 }
@@ -1320,6 +1274,8 @@ on_wait_finger_reply (FpDevice *dev, guint8 *data, guint16 length,
     }
 
   fp_dbg ("Finger detected (fdt_down push, %d bytes)", length);
+  fpi_device_report_finger_status_changes (dev, FP_FINGER_STATUS_PRESENT,
+                                           FP_FINGER_STATUS_NEEDED);
   fpi_ssm_next_state (ssm);
 }
 
@@ -1381,64 +1337,110 @@ flat_field_squash (const guint16 *frame, const guint16 *reference,
     }
 }
 
+/**
+ * compute_clipped_fraction: fraction of raw12 pixels at/above ADC full
+ * scale, i.e. the non-contact area of a live frame. decode_frame() uses the
+ * same 12-bit packing as the sibling goodix53x5 driver's
+ * goodix_device_decode_image() (bit-identical chunk layout), and this
+ * project's own gain sweep (NOTES.md, "Ridge visibility resolved") confirms
+ * this device's raw samples span the same 0-4095 range, so
+ * GOODIX533C_RAW12_CLIP reuses goodix53x5's GOODIX_RAW12_CLIP value as-is.
+ */
+static double
+compute_clipped_fraction (const guint16 *img12)
+{
+  guint32 clipped = 0;
+  guint32 i;
+
+  for (i = 0; i < GOODIX533C_IMAGE_PIXELS; i++)
+    if (img12[i] >= GOODIX533C_RAW12_CLIP)
+      clipped++;
+
+  return (double) clipped / GOODIX533C_IMAGE_PIXELS;
+}
+
+/* ===========================================================================
+ * Reference-frame capture sub-SSM (attempt-scoped): power the sensor and
+ * capture the TX-off no-finger reference frame into self->reference_pixels.
+ * Must run before goodix533c_start_live_capture_subsm().
+ * ======================================================================= */
+
+enum ref_capture_stage {
+  REF_CAPTURE_ON = 0,
+  REF_CAPTURE_GET_IMAGE,
+  REF_CAPTURE_OFF,
+  REF_CAPTURE_NUM_STATES,
+};
+
 static void
-capture_run (FpiSsm *ssm, FpDevice *dev)
+ref_capture_ssm_handler (FpiSsm *ssm, FpDevice *dev)
 {
   switch (fpi_ssm_get_cur_state (ssm))
     {
-    case CAPTURE_STAGE_RESET:
-      cmd_reset (dev, TRUE, FALSE, 20, on_reset_reply, ssm);
-      break;
-
-    case CAPTURE_STAGE_READ_CHIP_ID:
-      cmd_read_sensor_register (dev, 0x0000, 4, on_capture_step_reply, ssm);
-      break;
-
-    case CAPTURE_STAGE_READ_OTP:
-      cmd_read_otp (dev, on_capture_step_reply, ssm);
-      break;
-
-    case CAPTURE_STAGE_TLS:
-      tls_connect (dev, on_tls_connected, ssm);
-      break;
-
-    case CAPTURE_STAGE_UPLOAD_CONFIG:
-      cmd_upload_config_mcu (dev, device_config, sizeof (device_config),
-                             on_upload_config_reply, ssm);
-      break;
-
-    case CAPTURE_STAGE_FDT_BASELINE:
-        {
-          guint8 mode[26];
-
-          memcpy (mode, fdt_mode_idle, sizeof (fdt_mode_idle));
-          memset (mode + sizeof (fdt_mode_idle), 0,
-                 sizeof (mode) - sizeof (fdt_mode_idle));
-          cmd_mcu_switch_to_fdt_mode (dev, mode, sizeof (mode), TRUE,
-                                     on_fdt_baseline_reply, ssm);
-        }
-      break;
-
-    case CAPTURE_STAGE_CAPTURE_ON:
+    case REF_CAPTURE_ON:
       cmd_write_sensor_register (dev, GOODIX533C_CAPTURE_REGISTER,
                                  capture_on, on_capture_step_reply, ssm);
       break;
 
-    case CAPTURE_STAGE_GET_IMAGE:
+    case REF_CAPTURE_GET_IMAGE:
       cmd_mcu_get_image_gain (dev, GOODIX533C_IMAGE_FLAGS_CALIBRATE,
-                              GOODIX533C_IMAGE_GAIN, on_get_image_reply, ssm);
+                              GOODIX533C_IMAGE_GAIN, on_ref_get_image_reply,
+                              ssm);
       break;
 
-    case CAPTURE_STAGE_CAPTURE_OFF:
+    case REF_CAPTURE_OFF:
       cmd_write_sensor_register (dev, GOODIX533C_CAPTURE_REGISTER,
                                  capture_off, on_capture_step_reply, ssm);
       break;
 
-    case CAPTURE_STAGE_SLEEP:
+    default:
+      g_assert_not_reached ();
+    }
+}
+
+void
+goodix533c_start_ref_capture_subsm (FpiSsm *parent_ssm, FpDevice *dev)
+{
+  FpiSsm *sub = fpi_ssm_new (dev, ref_capture_ssm_handler,
+                             REF_CAPTURE_NUM_STATES);
+
+  fpi_ssm_start_subsm (parent_ssm, sub);
+}
+
+/* ===========================================================================
+ * Finger-wait sub-SSM (attempt-scoped): arm finger-down detection and block
+ * until the device's asynchronous touch notification arrives.
+ * ======================================================================= */
+
+enum finger_wait_stage {
+  FINGER_WAIT_SLEEP = 0,
+  FINGER_WAIT_QUERY_MCU_STATE,
+  FINGER_WAIT_FDT_ARM_DOWN,
+  FINGER_WAIT_WAIT_FOR_FINGER,
+  FINGER_WAIT_FDT_MODE_ARM,
+  FINGER_WAIT_NUM_STATES,
+};
+
+typedef struct
+{
+  Goodix533cProgressFunc cb;        /* nullable, see goodix533c-private.h */
+  gpointer                user_data;
+} FingerWaitData;
+
+static void
+finger_wait_ssm_handler (FpiSsm *ssm, FpDevice *dev)
+{
+  FpiDeviceGoodix533c *self = FPI_DEVICE_GOODIX533C (dev);
+
+  switch (fpi_ssm_get_cur_state (ssm))
+    {
+    case FINGER_WAIT_SLEEP:
+      fpi_device_report_finger_status_changes (dev, FP_FINGER_STATUS_NEEDED,
+                                               FP_FINGER_STATUS_PRESENT);
       cmd_mcu_switch_to_sleep_mode (dev, on_capture_step_reply, ssm);
       break;
 
-    case CAPTURE_STAGE_QUERY_MCU_STATE:
+    case FINGER_WAIT_QUERY_MCU_STATE:
         {
           /* Payload taken verbatim from run_driver()'s
            * query_mcu_state(b"\x01\x00\x01", False) call site. */
@@ -1449,9 +1451,8 @@ capture_run (FpiSsm *ssm, FpDevice *dev)
         }
       break;
 
-    case CAPTURE_STAGE_FDT_ARM_DOWN:
+    case FINGER_WAIT_FDT_ARM_DOWN:
         {
-          FpiDeviceGoodix533c *self = FPI_DEVICE_GOODIX533C (dev);
           guint8 mode[26];
 
           memcpy (mode, fdt_down_armed, sizeof (fdt_down_armed));
@@ -1462,20 +1463,19 @@ capture_run (FpiSsm *ssm, FpDevice *dev)
         }
       break;
 
-    case CAPTURE_STAGE_WAIT_FOR_FINGER:
+    case FINGER_WAIT_WAIT_FOR_FINGER:
         {
-          CaptureData *cap = fpi_ssm_get_data (ssm);
+          FingerWaitData *data = fpi_ssm_get_data (ssm);
 
-          if (cap->wait_for_finger_cb)
-            cap->wait_for_finger_cb (dev, cap->user_data);
+          if (data->cb)
+            data->cb (dev, data->user_data);
           await_fdt_down_push (dev, GOODIX533C_FINGER_WAIT_TIMEOUT_MS,
                                on_wait_finger_reply, ssm);
         }
       break;
 
-    case CAPTURE_STAGE_FDT_MODE_ARM:
+    case FINGER_WAIT_FDT_MODE_ARM:
         {
-          FpiDeviceGoodix533c *self = FPI_DEVICE_GOODIX533C (dev);
           guint8 mode[26];
 
           memcpy (mode, fdt_mode_armed, sizeof (fdt_mode_armed));
@@ -1491,35 +1491,178 @@ capture_run (FpiSsm *ssm, FpDevice *dev)
         }
       break;
 
-    case CAPTURE_STAGE_CAPTURE_ON_LIVE:
+    default:
+      g_assert_not_reached ();
+    }
+}
+
+void
+goodix533c_start_finger_wait_subsm (FpiSsm                 *parent_ssm,
+                                    FpDevice               *dev,
+                                    Goodix533cProgressFunc  wait_for_finger_cb,
+                                    gpointer                wait_for_finger_data)
+{
+  FpiSsm *sub = fpi_ssm_new (dev, finger_wait_ssm_handler,
+                             FINGER_WAIT_NUM_STATES);
+  FingerWaitData *data = g_new0 (FingerWaitData, 1);
+
+  data->cb = wait_for_finger_cb;
+  data->user_data = wait_for_finger_data;
+  fpi_ssm_set_data (sub, data, g_free);
+
+  fpi_ssm_start_subsm (parent_ssm, sub);
+}
+
+/* ===========================================================================
+ * Live-capture sub-SSM (attempt-scoped): capture the live (finger-present)
+ * frame, decrypt/decode it, then flat-field it against
+ * self->reference_pixels and compute the clipped-fraction quality metric --
+ * both new relative to the original single-shot flow, needed so
+ * enroll/verify/identify can quality-gate and match immediately, before
+ * waiting for finger-up.
+ * ======================================================================= */
+
+enum live_capture_stage {
+  LIVE_CAPTURE_ON = 0,
+  LIVE_CAPTURE_GET_IMAGE,
+  LIVE_CAPTURE_OFF,
+  LIVE_CAPTURE_PROCESS,
+  LIVE_CAPTURE_NUM_STATES,
+};
+
+static void
+live_capture_ssm_handler (FpiSsm *ssm, FpDevice *dev)
+{
+  FpiDeviceGoodix533c *self = FPI_DEVICE_GOODIX533C (dev);
+
+  switch (fpi_ssm_get_cur_state (ssm))
+    {
+    case LIVE_CAPTURE_ON:
       cmd_write_sensor_register (dev, GOODIX533C_CAPTURE_REGISTER,
                                  capture_on, on_capture_step_reply, ssm);
       break;
 
-    case CAPTURE_STAGE_GET_IMAGE_LIVE:
+    case LIVE_CAPTURE_GET_IMAGE:
       /* Gain 0xc2, not driver_53xc.py's default 0x86 for the live frame --
        * see GOODIX533C_LIVE_IMAGE_GAIN's doc comment above for why this is
        * a deliberate, hardware-verified deviation on this unit. */
       cmd_mcu_get_image_gain (dev, GOODIX533C_IMAGE_FLAGS_LIVE,
-                              GOODIX533C_LIVE_IMAGE_GAIN, on_get_image_reply,
-                              ssm);
+                              GOODIX533C_LIVE_IMAGE_GAIN,
+                              on_live_get_image_reply, ssm);
       break;
 
-    case CAPTURE_STAGE_CAPTURE_OFF_LIVE:
+    case LIVE_CAPTURE_OFF:
       cmd_write_sensor_register (dev, GOODIX533C_CAPTURE_REGISTER,
                                  capture_off, on_capture_step_reply, ssm);
       break;
 
-    case CAPTURE_STAGE_FDT_UP:
+    case LIVE_CAPTURE_PROCESS:
+      if (self->live_raw_pixels == NULL || !self->have_reference)
         {
-          FpiDeviceGoodix533c *self = FPI_DEVICE_GOODIX533C (dev);
+          fpi_ssm_mark_failed (ssm,
+                               fpi_device_error_new_msg (FP_DEVICE_ERROR_PROTO,
+                                                         "Missing reference or live frame"));
+          return;
+        }
+
+      self->captured_clipped_fraction =
+        compute_clipped_fraction (self->live_raw_pixels);
+
+      g_clear_pointer (&self->captured_image, g_free);
+      self->captured_image = g_new0 (guint8, GOODIX533C_IMAGE_PIXELS);
+      flat_field_squash (self->live_raw_pixels, self->reference_pixels,
+                         GOODIX533C_IMAGE_PIXELS, self->captured_image);
+
+      fpi_ssm_next_state (ssm);
+      break;
+
+    default:
+      g_assert_not_reached ();
+    }
+}
+
+void
+goodix533c_start_live_capture_subsm (FpiSsm *parent_ssm, FpDevice *dev)
+{
+  FpiSsm *sub = fpi_ssm_new (dev, live_capture_ssm_handler,
+                             LIVE_CAPTURE_NUM_STATES);
+
+  fpi_ssm_start_subsm (parent_ssm, sub);
+}
+
+/* ===========================================================================
+ * Finger-up sub-SSM (attempt-scoped): block until finger lift-off is
+ * detected, so a lingering touch is never misread as the next attempt's
+ * touch. mcu_switch_to_fdt_up's reply itself blocks until the device sees
+ * the down->up transition (hardware-verified this session for a single
+ * capture), so this is a thin wrapper around the existing command rather
+ * than new detection logic.
+ * ======================================================================= */
+
+enum finger_up_stage {
+  FINGER_UP_WAIT = 0,
+  FINGER_UP_NUM_STATES,
+};
+
+static void
+on_finger_up_reply (FpDevice *dev, guint8 *data, guint16 length,
+                    gpointer user_data, GError *error)
+{
+  FpiSsm *ssm = user_data;
+
+  if (error)
+    {
+      /* A bare timeout here just means the user has not lifted their
+       * finger within GOODIX533C_FDT_UP_TIMEOUT_MS (5s) yet -- unlike the
+       * finger-wait timeout above, this is not necessarily user error, and
+       * failing the whole enroll/verify/identify action over it would be
+       * harsh, especially for enroll, which runs this after every one of
+       * GOODIX533C_ENROLL_SAMPLES stages. Treat a timeout as "assume
+       * lifted" and proceed instead of aborting the action.
+       *
+       * This reintroduces some of the staleness risk the wait exists to
+       * prevent (a finger still down could be misread as part of the next
+       * attempt) and has not been exercised against real hardware with a
+       * deliberately slow lift-off -- see the report for what a human
+       * needs to validate here. Any other error remains fatal. */
+      if (g_error_matches (error, G_IO_ERROR, G_IO_ERROR_TIMED_OUT))
+        {
+          fp_warn ("Finger-up wait timed out after %dms; assuming lifted "
+                   "and continuing", GOODIX533C_FDT_UP_TIMEOUT_MS);
+          g_clear_error (&error);
+          fpi_device_report_finger_status_changes (dev, FP_FINGER_STATUS_NONE,
+                                                   FP_FINGER_STATUS_PRESENT |
+                                                   FP_FINGER_STATUS_NEEDED);
+          fpi_ssm_next_state (ssm);
+          return;
+        }
+
+      fpi_ssm_mark_failed (ssm, error);
+      return;
+    }
+
+  fpi_device_report_finger_status_changes (dev, FP_FINGER_STATUS_NONE,
+                                           FP_FINGER_STATUS_PRESENT |
+                                           FP_FINGER_STATUS_NEEDED);
+  fpi_ssm_next_state (ssm);
+}
+
+static void
+finger_up_ssm_handler (FpiSsm *ssm, FpDevice *dev)
+{
+  FpiDeviceGoodix533c *self = FPI_DEVICE_GOODIX533C (dev);
+
+  switch (fpi_ssm_get_cur_state (ssm))
+    {
+    case FINGER_UP_WAIT:
+        {
           guint8 mode[26];
 
           memcpy (mode, fdt_up_armed, sizeof (fdt_up_armed));
           memcpy (mode + sizeof (fdt_up_armed), self->fdt_template,
                  sizeof (self->fdt_template));
           cmd_mcu_switch_to_fdt_up (dev, mode, sizeof (mode),
-                                   on_capture_step_reply, ssm);
+                                   on_finger_up_reply, ssm);
         }
       break;
 
@@ -1528,28 +1671,110 @@ capture_run (FpiSsm *ssm, FpDevice *dev)
     }
 }
 
-static void
-capture_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+void
+goodix533c_start_finger_up_subsm (FpiSsm *parent_ssm, FpDevice *dev)
+{
+  FpiSsm *sub = fpi_ssm_new (dev, finger_up_ssm_handler,
+                             FINGER_UP_NUM_STATES);
+
+  fpi_ssm_start_subsm (parent_ssm, sub);
+}
+
+/* ===========================================================================
+ * cancel() support: force-fail whatever command is currently in flight.
+ * ======================================================================= */
+
+void
+goodix533c_cancel_pending_command (FpDevice *dev)
 {
   FpiDeviceGoodix533c *self = FPI_DEVICE_GOODIX533C (dev);
-  CaptureData *cap = fpi_ssm_get_data (ssm);
+  GError *error = NULL;
 
-  /* Flat-field only if the live frame actually got captured -- e.g. the
-   * finger-wait stage timing out (the only path exercised against real
-   * hardware this session, since it requires no physical touch) leaves
-   * live_raw_pixels NULL and error non-NULL, and cap->raw_pixels/squashed
-   * (the reference frame, captured earlier in this same sequence) are
-   * still handed back below regardless of @error, so a harness never
-   * loses a frame that did succeed just because a later stage failed. */
-  if (cap->live_raw_pixels && self->have_reference)
+  if (!self->ack_pending && !self->reply_pending)
+    return;
+
+  g_set_error_literal (&error, G_IO_ERROR, G_IO_ERROR_CANCELLED,
+                       "Action cancelled");
+  deliver_reply (dev, NULL, 0, error);
+}
+
+/* ===========================================================================
+ * Test-only capture harness -- chains the four sub-SSMs above in the same
+ * order the original monolithic capture_run() used, then synthesizes the
+ * legacy Goodix533cCaptureDoneFunc callback shape from whatever
+ * self->reference_pixels / self->live_raw_pixels / self->captured_image
+ * hold at completion time. Those fields persist past whichever sub-SSM
+ * produced them (unlike the old per-call CaptureData struct), so a frame
+ * that did succeed is never lost just because a later stage (e.g.
+ * finger-wait timing out with no physical touch) failed.
+ * ======================================================================= */
+
+enum capture_test_stage {
+  CAPTURE_TEST_REF = 0,
+  CAPTURE_TEST_FINGER_WAIT,
+  CAPTURE_TEST_LIVE,
+  CAPTURE_TEST_FINGER_UP,
+  CAPTURE_TEST_NUM_STATES,
+};
+
+typedef struct
+{
+  Goodix533cProgressFunc    wait_for_finger_cb;
+  Goodix533cCaptureDoneFunc callback;
+  gpointer                  user_data;
+} CaptureTestData;
+
+static void
+capture_test_ssm_handler (FpiSsm *ssm, FpDevice *dev)
+{
+  CaptureTestData *data = fpi_ssm_get_data (ssm);
+
+  switch (fpi_ssm_get_cur_state (ssm))
     {
-      cap->corrected = g_new0 (guint8, GOODIX533C_IMAGE_PIXELS);
-      flat_field_squash (cap->live_raw_pixels, self->reference_pixels,
-                         GOODIX533C_IMAGE_PIXELS, cap->corrected);
+    case CAPTURE_TEST_REF:
+      goodix533c_start_ref_capture_subsm (ssm, dev);
+      break;
+
+    case CAPTURE_TEST_FINGER_WAIT:
+      goodix533c_start_finger_wait_subsm (ssm, dev, data->wait_for_finger_cb,
+                                          data->user_data);
+      break;
+
+    case CAPTURE_TEST_LIVE:
+      goodix533c_start_live_capture_subsm (ssm, dev);
+      break;
+
+    case CAPTURE_TEST_FINGER_UP:
+      goodix533c_start_finger_up_subsm (ssm, dev);
+      break;
+
+    default:
+      g_assert_not_reached ();
+    }
+}
+
+static void
+capture_test_ssm_done (FpiSsm *ssm, FpDevice *dev, GError *error)
+{
+  FpiDeviceGoodix533c *self = FPI_DEVICE_GOODIX533C (dev);
+  CaptureTestData *data = fpi_ssm_get_data (ssm);
+  guint16 *raw_pixels = NULL;
+  g_autofree guint8 *squashed = NULL;
+  guint8 *corrected = NULL;
+
+  if (self->have_reference && self->reference_pixels)
+    {
+      raw_pixels = self->reference_pixels;
+      squashed = g_new0 (guint8, GOODIX533C_IMAGE_PIXELS);
+      squash_frame_linear (self->reference_pixels, squashed,
+                           GOODIX533C_IMAGE_PIXELS);
     }
 
-  cap->callback (dev, cap->raw_pixels, cap->squashed, cap->live_raw_pixels,
-                cap->corrected, cap->user_data, error);
+  if (self->live_raw_pixels && self->captured_image)
+    corrected = self->captured_image;
+
+  data->callback (dev, raw_pixels, squashed, self->live_raw_pixels,
+                  corrected, data->user_data, error);
 }
 
 void
@@ -1558,16 +1783,16 @@ fpi_device_goodix533c_capture_test (FpDevice *dev,
                                     Goodix533cCaptureDoneFunc callback,
                                     gpointer user_data)
 {
-  CaptureData *cap = g_new0 (CaptureData, 1);
+  CaptureTestData *data = g_new0 (CaptureTestData, 1);
   FpiSsm *ssm;
 
-  cap->wait_for_finger_cb = wait_for_finger_cb;
-  cap->callback = callback;
-  cap->user_data = user_data;
+  data->wait_for_finger_cb = wait_for_finger_cb;
+  data->callback = callback;
+  data->user_data = user_data;
 
-  ssm = fpi_ssm_new (dev, capture_run, CAPTURE_STAGE_NUM);
-  fpi_ssm_set_data (ssm, cap, (GDestroyNotify) capture_data_free);
-  fpi_ssm_start (ssm, capture_done);
+  ssm = fpi_ssm_new (dev, capture_test_ssm_handler, CAPTURE_TEST_NUM_STATES);
+  fpi_ssm_set_data (ssm, data, g_free);
+  fpi_ssm_start (ssm, capture_test_ssm_done);
 }
 
 /* ===========================================================================
@@ -1576,12 +1801,29 @@ fpi_device_goodix533c_capture_test (FpDevice *dev,
  * init_device(). Ported logic, new SSM (goodix.c has no equivalent
  * standalone open sequence -- that's spread across goodix5xx.c's shared
  * ACTIVATE state machine, which this driver deliberately does not use).
+ *
+ * RESET through FDT_BASELINE used to be the first six states of the
+ * single-shot capture_run() SSM (see capture_test.c's original flow).
+ * They are session-scoped -- TLS handshake, config upload, and the FDT
+ * threshold template are all valid for the whole open() session, not just
+ * one capture -- so they belong here, run once, rather than being repeated
+ * by every enroll stage or verify/identify attempt. Everything
+ * attempt-scoped (reference capture, finger wait, live capture, finger up)
+ * lives in the sub-SSM starter functions below instead; enroll/verify/
+ * identify assume open() has already brought the device through
+ * FDT_BASELINE and call only those.
  * ======================================================================= */
 
 enum open_stage {
   OPEN_STAGE_NOP,
   OPEN_STAGE_FIRMWARE_VERSION,
   OPEN_STAGE_PSK_READ,
+  OPEN_STAGE_RESET,
+  OPEN_STAGE_READ_CHIP_ID,
+  OPEN_STAGE_READ_OTP,
+  OPEN_STAGE_TLS,
+  OPEN_STAGE_UPLOAD_CONFIG,
+  OPEN_STAGE_FDT_BASELINE,
   OPEN_STAGE_NUM,
 };
 
@@ -1710,6 +1952,39 @@ open_run (FpiSsm *ssm, FpDevice *dev)
                            0, on_open_psk_read_reply, ssm);
       break;
 
+    case OPEN_STAGE_RESET:
+      cmd_reset (dev, TRUE, FALSE, 20, on_reset_reply, ssm);
+      break;
+
+    case OPEN_STAGE_READ_CHIP_ID:
+      cmd_read_sensor_register (dev, 0x0000, 4, on_capture_step_reply, ssm);
+      break;
+
+    case OPEN_STAGE_READ_OTP:
+      cmd_read_otp (dev, on_capture_step_reply, ssm);
+      break;
+
+    case OPEN_STAGE_TLS:
+      tls_connect (dev, on_tls_connected, ssm);
+      break;
+
+    case OPEN_STAGE_UPLOAD_CONFIG:
+      cmd_upload_config_mcu (dev, device_config, sizeof (device_config),
+                             on_upload_config_reply, ssm);
+      break;
+
+    case OPEN_STAGE_FDT_BASELINE:
+        {
+          guint8 mode[26];
+
+          memcpy (mode, fdt_mode_idle, sizeof (fdt_mode_idle));
+          memset (mode + sizeof (fdt_mode_idle), 0,
+                 sizeof (mode) - sizeof (fdt_mode_idle));
+          cmd_mcu_switch_to_fdt_mode (dev, mode, sizeof (mode), TRUE,
+                                     on_fdt_baseline_reply, ssm);
+        }
+      break;
+
     default:
       g_assert_not_reached ();
     }
@@ -1792,6 +2067,17 @@ goodix533c_close (FpDevice *dev)
   self->have_reference = FALSE;
   self->have_fdt_template = FALSE;
 
+  /* Attempt-scoped enroll/verify/identify state -- also cleared here (not
+   * just at the end of each action) in case close() runs mid-action, e.g.
+   * the client disconnecting during an enroll. */
+  g_clear_pointer (&self->live_raw_pixels, g_free);
+  g_clear_pointer (&self->captured_image, g_free);
+  g_clear_pointer (&self->enroll_features, g_ptr_array_unref);
+  self->enroll_stage = 0;
+  self->task_ssm = NULL;
+  self->verify_wait_finger_up = FALSE;
+  goodix533c_clear_pending_result_report (self);
+
   if (self->interface_claimed)
     {
       g_usb_device_release_interface (fpi_device_get_usb_device (dev),
@@ -1800,6 +2086,30 @@ goodix533c_close (FpDevice *dev)
     }
 
   fpi_device_close_complete (dev, error);
+}
+
+static void
+goodix533c_enroll (FpDevice *dev)
+{
+  goodix533c_enroll_start (dev);
+}
+
+static void
+goodix533c_verify (FpDevice *dev)
+{
+  goodix533c_auth_start (dev);
+}
+
+static void
+goodix533c_identify (FpDevice *dev)
+{
+  goodix533c_auth_start (dev);
+}
+
+static void
+goodix533c_cancel (FpDevice *dev)
+{
+  goodix533c_cancel_pending_command (dev);
 }
 
 /* ===========================================================================
@@ -1818,6 +2128,10 @@ fpi_device_goodix533c_finalize (GObject *object)
 
   g_clear_pointer (&self->rx_buf, g_free);
   g_clear_pointer (&self->reference_pixels, g_free);
+  g_clear_pointer (&self->live_raw_pixels, g_free);
+  g_clear_pointer (&self->captured_image, g_free);
+  g_clear_pointer (&self->enroll_features, g_ptr_array_unref);
+  goodix533c_clear_pending_result_report (self);
   g_clear_object (&self->transfer_cancel_tkn);
 
   G_OBJECT_CLASS (fpi_device_goodix533c_parent_class)->finalize (object);
@@ -1841,15 +2155,24 @@ fpi_device_goodix533c_class_init (FpiDeviceGoodix533cClass *klass)
   dev_class->type = FP_DEVICE_TYPE_USB;
   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
   dev_class->id_table = goodix533c_id_table;
-  dev_class->nr_enroll_stages = 1;
+  dev_class->nr_enroll_stages = GOODIX533C_ENROLL_SAMPLES;
   dev_class->temp_hot_seconds = -1;
-  /* FpDevice requires a non-NONE feature set (see fp_device_constructed()'s
-   * g_assert). FP_DEVICE_FEATURE_CAPTURE is the accurate declaration here
-   * and, unlike VERIFY/IDENTIFY, does not require those vfuncs to be set --
-   * enroll/verify/identify are out of scope for this driver so far; open()
-   * + capture is exercised only via fpi_device_goodix533c_capture_test(). */
-  dev_class->features = FP_DEVICE_FEATURE_CAPTURE;
 
   dev_class->open = goodix533c_open;
   dev_class->close = goodix533c_close;
+  dev_class->enroll = goodix533c_enroll;
+  dev_class->verify = goodix533c_verify;
+  dev_class->identify = goodix533c_identify;
+  dev_class->cancel = goodix533c_cancel;
+
+  /* No dev_class->capture vfunc is wired -- open() + capture is exercised
+   * only via the test-only fpi_device_goodix533c_capture_test() entry
+   * point, so auto_initialize_features() correctly does not claim
+   * FP_DEVICE_FEATURE_CAPTURE (it only sets that bit when
+   * dev_class->capture is non-NULL). It does pick up VERIFY/IDENTIFY from
+   * the vfuncs just set, and FP_DEVICE_FEATURE_ALWAYS_ON from
+   * temp_hot_seconds < 0 above -- matching the sibling goodixtls511
+   * driver's convention of calling this once at the end of class_init()
+   * rather than assigning dev_class->features by hand. */
+  fpi_device_class_auto_initialize_features (dev_class);
 }
